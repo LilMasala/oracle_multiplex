@@ -3,21 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ExpertScorer(nn.Module):
-    """
-    A single 'Binding Theory' physics engine.
-    Evaluates the compatibility between a refined protein and a query drug.
-    """
-    def __init__(self, protein_dim, drug_dim, hidden_dim=256, dropout=0.1):
+    def __init__(self, protein_dim, drug_dim, hidden_dim=256, dropout=0.2):
         super().__init__()
-        # Interaction features: [Prot, Drug, Prot*Drug, |Prot-Drug|]
-        # Assumes protein_dim == drug_dim for the element-wise ops, 
-        # or you can project them to the same dim first. 
-        # Let's project them to a shared interaction space to be safe.
         self.p_proj = nn.Linear(protein_dim, hidden_dim)
         self.d_proj = nn.Linear(drug_dim, hidden_dim)
         
+        # ADDED: Bilinear layer to explicitly model the interaction physics
+        self.interaction = nn.Bilinear(hidden_dim, hidden_dim, hidden_dim)
+        
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
             nn.PReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -26,17 +20,15 @@ class ExpertScorer(nn.Module):
         )
 
     def forward(self, z_p, z_d):
-        # Project to shared space
-        p = self.p_proj(z_p)  # [1, H] or [B, H]
-        d = self.d_proj(z_d)  # [M, H] (M = number of query drugs)
+        p = self.p_proj(z_p)  
+        d = self.d_proj(z_d)  
         
-        # Broadcast protein to match number of query drugs
         if p.size(0) == 1 and d.size(0) > 1:
             p = p.expand(d.size(0), -1)
             
-        # Build interaction vector
-        interaction = torch.cat([p, d, p * d, torch.abs(p - d)], dim=-1)
-        return self.mlp(interaction).squeeze(-1) # [M]
+        # The Bilinear layer maps (Prot, Drug) directly to a joint representation
+        joint_rep = self.interaction(p, d)
+        return self.mlp(joint_rep).squeeze(-1)
 
 
 class MultiplexMoEGate(nn.Module):

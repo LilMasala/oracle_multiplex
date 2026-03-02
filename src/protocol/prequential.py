@@ -12,18 +12,17 @@ import torch
 import numpy as np
 
 class ProteinEpisode:
-    def __init__(self, t, protein_idx, support_edges, support_labels, query_edges, query_labels):
+    def __init__(self, t, protein_idx, edges, labels):
         self.t = t
         self.protein_idx = protein_idx
-        self.support_edges = support_edges   # [2, num_support] (protein_idx, drug_idx)
-        self.support_labels = support_labels # [num_support] (pIC50 values)
-        self.query_edges = query_edges       # [2, num_query]
-        self.query_labels = query_labels     # [num_query]
+        # ALL known edges for this protein (treated as zero-shot queries first)
+        self.edges = edges       # [2, num_edges] (protein_idx, drug_idx)
+        self.labels = labels     # [num_edges] (pIC50 values)
 
-def build_multiplex_stream(data, binds_metric="binds_pic50", support_k=8, min_edges=10, seed=42):
+def build_multiplex_stream(data, binds_metric="binds_pic50", min_edges=10, seed=42):
     """
-    Builds the prequential stream of proteins.
-    Only includes proteins with at least `min_edges` to ensure we have a valid query set.
+    Builds the prequential stream of proteins for a Pure Cold-Start Screener.
+    No support/query split: the model must rank ALL known drugs for a protein blindly.
     """
     rng = np.random.default_rng(seed)
     
@@ -34,34 +33,24 @@ def build_multiplex_stream(data, binds_metric="binds_pic50", support_k=8, min_ed
     num_proteins = data["protein"].num_nodes
     degrees = torch.bincount(binds_ei[0], minlength=num_proteins)
     
-    # Valid proteins for the stream
+    # Valid proteins for the stream (min 10 edges to ensure meaningful CI calculation)
     valid_proteins = torch.where(degrees >= min_edges)[0].tolist()
     
-    # Shuffle for arrival order (can also sort by degree for dense-to-sparse curriculum)
+    # Randomly shuffle so stream difficulty is uniformly distributed!
     rng.shuffle(valid_proteins)
     
     episodes = []
     for t, p_idx in enumerate(valid_proteins):
-        # Get all edges for this protein
+        # Extract ALL edges and labels for this specific protein
         mask = binds_ei[0] == p_idx
         p_edges = binds_ei[:, mask]
         p_labels = binds_y[mask]
         
-        # Shuffle edges to split support/query
-        n_edges = p_edges.size(1)
-        perm = torch.randperm(n_edges, generator=torch.Generator().manual_seed(seed + t))
-        
-        k_sup = min(support_k, n_edges // 2) # Ensure we have enough for query
-        sup_idx = perm[:k_sup]
-        qry_idx = perm[k_sup:]
-        
         ep = ProteinEpisode(
             t=t,
             protein_idx=p_idx,
-            support_edges=p_edges[:, sup_idx],
-            support_labels=p_labels[sup_idx],
-            query_edges=p_edges[:, qry_idx],
-            query_labels=p_labels[qry_idx]
+            edges=p_edges,
+            labels=p_labels
         )
         episodes.append(ep)
         
