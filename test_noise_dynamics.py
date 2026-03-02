@@ -97,9 +97,9 @@ def run_noise_test():
 
         # --- SUPPORT TRAINING (THE AUTOPSY) ---
         support_preds, gate_probs, expert_tensor = model(pillar, data["drug"].x, support_edges[1])
-        total_loss, support_mse, gate_penalty = loss_fn(support_preds, support_labels, gate_probs, expert_tensor)
-        
-        total_loss.backward()
+        losses = loss_fn(support_preds, support_labels, gate_probs, expert_tensor)
+
+        losses["total_loss"].backward()
         # Gradient clipping because MoE gates can get unstable on pure noise
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -107,7 +107,11 @@ def run_noise_test():
         # --- MEMORY BANK EXPANSION ---
         loader.add_revealed_edges(support_edges, support_labels)
 
-        print(f"Prot {prot_idx:02d} | Query MSE (Blind): {query_mse:.4f} | Supp MSE (Train): {support_mse:.4f} | Gate Pen: {gate_penalty:.4f}")
+        print(
+            f"Prot {prot_idx:02d} | Query MSE (Blind): {query_mse:.4f} "
+            f"| Supp Expert Loss: {losses['expert_loss'].item():.4f} "
+            f"| Gate Pen: {losses['gate_loss'].item():.4f}"
+        )
 
 if __name__ == "__main__":
     run_noise_test()

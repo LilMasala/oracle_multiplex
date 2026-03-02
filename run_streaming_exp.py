@@ -91,8 +91,14 @@ def main():
     # Start the stream with zero prior binding knowledge
     loader.binds_ei = torch.empty((2, 0), dtype=torch.long, device=device)
     loader.binds_y = torch.empty((0,), dtype=torch.float, device=device)
+    loader.binds_w = torch.empty((0,), dtype=torch.float, device=device)
+    loader.edge_birth_t = torch.empty((0,), dtype=torch.float, device=device)
+    loader._build_bind_index_cache()
+
+    support_batch_size = 128
 
     for i, ep in enumerate(episodes):
+        loader.begin_episode(i)
         # The Inductive Smoother consults structural and functional neighbors
         pillar = loader.get_pillar_context(ep.protein_idx)
         
@@ -123,16 +129,25 @@ def main():
         # Phase 2: Full Backprop (Absorb Knowledge)
         model.train()
         optimizer.zero_grad()
-        
-        # Forward pass through specialized experts
-        sup_preds, s_gate_probs, s_experts = model(pillar, data["drug"].x, ep.edges[1])
-        
-        # ListNet ranking loss focuses the experts on retrieval
-        total_loss, rank_loss, gate_loss = loss_fn(sup_preds, ep.labels, s_gate_probs, s_experts)
-        
-        total_loss.backward()
+        loss_fn.step_schedule(i, len(episodes))
+
+        rank_losses = []
+        num_edges = ep.edges.size(1)
+        n_batches = max(1, (num_edges + support_batch_size - 1) // support_batch_size)
+        for b in range(n_batches):
+            start = b * support_batch_size
+            end = min((b + 1) * support_batch_size, num_edges)
+            mb_drugs = ep.edges[1][start:end]
+            mb_labels = ep.labels[start:end]
+
+            sup_preds, s_gate_probs, s_experts = model(pillar, data["drug"].x, mb_drugs)
+            losses = loss_fn(sup_preds, mb_labels, s_gate_probs, s_experts)
+            (losses["total_loss"] / n_batches).backward()
+            rank_losses.append(losses["rank_loss"].item())
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        rank_loss = float(np.mean(rank_losses)) if rank_losses else 0.0
         
         # Phase 3: Update Global Graph
         # Revealed edges allow future proteins to 'leak' affinity data

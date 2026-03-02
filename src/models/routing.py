@@ -2,124 +2,101 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class ExpertScorer(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim=256, dropout=0.2):
         super().__init__()
         self.p_proj = nn.Linear(protein_dim, hidden_dim)
         self.d_proj = nn.Linear(drug_dim, hidden_dim)
-        
-        # ADDED: Bilinear layer to explicitly model the interaction physics
         self.interaction = nn.Bilinear(hidden_dim, hidden_dim, hidden_dim)
-        
         self.mlp = nn.Sequential(
             nn.PReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.PReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
     def forward(self, z_p, z_d):
-        p = self.p_proj(z_p)  
-        d = self.d_proj(z_d)  
-        
+        p = self.p_proj(z_p)
+        d = self.d_proj(z_d)
         if p.size(0) == 1 and d.size(0) > 1:
             p = p.expand(d.size(0), -1)
-            
-        # The Bilinear layer maps (Prot, Drug) directly to a joint representation
         joint_rep = self.interaction(p, d)
         return self.mlp(joint_rep).squeeze(-1)
 
 
 class MultiplexMoEGate(nn.Module):
-    """
-    The Meta-Gate. Looks at the protein and the Trust signals to pick an expert.
-    """
-    def __init__(self, protein_dim, num_experts, hidden_dim=128):
+    """The Meta-Gate. Looks at the protein and trust diagnostics to pick experts."""
+
+    def __init__(self, protein_dim, num_experts, hidden_dim=128, top_k=2):
         super().__init__()
-        # Input: [Z_refined (protein_dim) + Trust_form (1) + Trust_role (1)]
+        self.top_k = top_k
+        # Input: protein + form_trust(3) + role_trust(3) + cross-floor agreement(1)
         self.router = nn.Sequential(
-            nn.Linear(protein_dim + 2, hidden_dim),
+            nn.Linear(protein_dim + 7, hidden_dim),
             nn.PReLU(),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, num_experts)
+            nn.Linear(hidden_dim, num_experts),
         )
 
-    def forward(self, z_refined, trust_form, trust_role):
-        # z_refined: [1, protein_dim]
-        # trust_form, trust_role: scalars converted to [1, 1] tensors
-        gate_input = torch.cat([
-            z_refined, 
-            trust_form.view(1, 1), 
-            trust_role.view(1, 1)
-        ], dim=-1)
-        
+    def forward(self, z_refined, trust_form, trust_role, cross_floor_jaccard):
+        gate_input = torch.cat(
+            [
+                z_refined,
+                trust_form.view(1, -1),
+                trust_role.view(1, -1),
+                cross_floor_jaccard.view(1, 1),
+            ],
+            dim=-1,
+        )
         logits = self.router(gate_input)
-        return F.softmax(logits, dim=-1) # [1, num_experts]
+
+        k = min(self.top_k, logits.size(-1))
+        if k < logits.size(-1):
+            top_vals, top_idx = torch.topk(logits, k=k, dim=-1)
+            sparse_logits = torch.full_like(logits, float("-inf"))
+            sparse_logits.scatter_(dim=-1, index=top_idx, src=top_vals)
+            logits = sparse_logits
+
+        return F.softmax(logits, dim=-1)
 
 
 class MultiplexRoutingHead(nn.Module):
-    """
-    Wraps the Trust Calculation, the Gate, and the Experts.
-    """
-    def __init__(self, protein_dim, drug_dim, num_experts=4):
+    def __init__(self, protein_dim, drug_dim, num_experts=4, top_k=2):
         super().__init__()
-        self.gate = MultiplexMoEGate(protein_dim, num_experts)
-        self.experts = nn.ModuleList([
-            ExpertScorer(protein_dim, drug_dim) for _ in range(num_experts)
-        ])
+        self.gate = MultiplexMoEGate(protein_dim, num_experts, top_k=top_k)
+        self.experts = nn.ModuleList([ExpertScorer(protein_dim, drug_dim) for _ in range(num_experts)])
 
-    def _calculate_trust(self, footprints):
-        """
-        Calculates the reliability (inverse variance) of a multiplex floor.
-        """
-        num_neighbors = footprints.size(0)
-        
-        if num_neighbors < 2:
-            # If 0 or 1 neighbor, we have no consensus. Trust is zero.
-            return torch.tensor(0.0, device=footprints.device)
-            
-        # Calculate variance across the neighbors for each feature dimension
-        # Shape: [drug_dim] -> mean() -> scalar
-        variance = torch.var(footprints, dim=0, unbiased=False).mean()
-        
-        # Convert variance to a bounded Trust score between 0 and 1
-        # Low variance -> High Trust (~1.0)
-        # High variance -> Low Trust (~0.0)
-        trust = 1.0 / (1.0 + variance)
-        return trust
+    def _calculate_trust_vector(self, footprints, floor_attn):
+        device = footprints.device
+        if footprints.size(0) == 0:
+            return torch.zeros(3, device=device)
 
-    def forward(self, z_refined, form_footprints, role_footprints, query_drug_features):
-        """
-        z_refined: [1, protein_dim] from Phase 2
-        form_footprints: [N_form, drug_dim] the raw messages before Phase 2 attention
-        role_footprints: [N_role, drug_dim] the raw messages before Phase 2 attention
-        query_drug_features: [M, drug_dim] the drugs we are actually trying to rank
-        """
+        neighbor_count = torch.log1p(torch.tensor(float(footprints.size(0)), device=device))
+
+        if floor_attn.numel() > 1:
+            p = floor_attn.clamp_min(1e-12)
+            entropy = -(p * p.log()).sum() / torch.log(torch.tensor(float(p.numel()), device=device))
+        else:
+            entropy = torch.tensor(0.0, device=device)
+
+        med = footprints.median(dim=0).values
+        mad = (footprints - med).abs().median(dim=0).values.mean()
+        robust_dispersion = 1.0 / (1.0 + mad)
+
+        return torch.stack([neighbor_count, 1.0 - entropy, robust_dispersion])
+
+    def forward(self, z_refined, form_footprints, role_footprints, query_drug_features, floor_stats, cross_floor_jaccard):
         if z_refined.dim() == 1:
             z_refined = z_refined.unsqueeze(0)
 
-        # 1. Audit the Floors (Calculate Trust)
-        trust_form = self._calculate_trust(form_footprints)
-        trust_role = self._calculate_trust(role_footprints)
-        
-        # 2. Route the Protein
-        # gate_probs: [1, num_experts]
-        gate_probs = self.gate(z_refined, trust_form, trust_role)
-        
-        # 3. Consult the Experts
-        # Each expert ranks all M query drugs.
-        # expert_predictions: List of tensors, each [M]
+        trust_form = self._calculate_trust_vector(form_footprints, floor_stats.get("form_attn", torch.empty(0, device=z_refined.device)))
+        trust_role = self._calculate_trust_vector(role_footprints, floor_stats.get("role_attn", torch.empty(0, device=z_refined.device)))
+
+        gate_probs = self.gate(z_refined, trust_form, trust_role, cross_floor_jaccard)
+
         expert_predictions = [expert(z_refined, query_drug_features) for expert in self.experts]
-        
-        # Stack into [M, num_experts]
-        expert_tensor = torch.stack(expert_predictions, dim=1) 
-        
-        # 4. Final Prediction
-        # Multiply each expert's prediction by the gate's confidence in that expert
-        # gate_probs is [1, K], expert_tensor is [M, K]. 
-        # Broadcasting handles the M query drugs automatically!
-        final_scores = torch.sum(expert_tensor * gate_probs, dim=-1) # [M]
-        
-        # We also return gate_probs and expert_tensor for the Phase 5 EBL Loss!
+        expert_tensor = torch.stack(expert_predictions, dim=1)
+        final_scores = torch.sum(expert_tensor * gate_probs, dim=-1)
         return final_scores, gate_probs, expert_tensor
