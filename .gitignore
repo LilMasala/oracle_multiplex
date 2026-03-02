@@ -1,0 +1,5 @@
+data/final_graph_data_not_normalized.pt
+models/*.pt
+**/__pycache__/
+*.pyc
+.DS_Store

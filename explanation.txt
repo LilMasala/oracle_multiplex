@@ -1,0 +1,80 @@
+Methods Report: The Oracle Multiplex
+
+Architecture: Inductive Multiplex Mixture-of-Experts (MoE)
+
+Task: Prequential Cold-Start Protein-Ligand Binding Affinity Prediction ($pIC_{50}$)
+
+1. The Core Problem: The "Information Base" vs. The "Blindfold"
+
+Standard Graph Neural Networks (GNNs) fail in drug discovery because they assume a static graph where all labels are known. In the real world, proteins arrive one by one. When a new protein arrives, it has zero known binding edges.
+
+The Oracle Multiplex solves this by treating the protein corpus not as a training set, but as a Living Information Base. We use a Prequential (Test-then-Train) Protocol to ensure that the model is evaluated on its ability to "leak" information from similar labeled proteins into a cold-start target.
+
+2. Phase 1: The Vertical Pillar & Prequential Stream
+
+The data is structured as a Multiplex Graph with two primary "floors" of protein-protein similarity:
+
+The Form Floor (Structural): Based on CATH structural folds and ESM-2 embeddings.
+
+The Role Floor (Functional): Based on shared Gene Ontology (GO) terms.
+
+The Streaming Protocol
+
+Arrival: A target protein $P_{target}$ enters the stream.
+
+Consultation: The MultiplexPillarSampler fetches the "Vertical Pillar"—the structural and functional neighbors of $P_{target}$ and their known binding histories.
+
+Deployment: The model predicts affinities for a set of Query Drugs while strictly blindfolded to $P_{target}$'s own labels.
+
+Revelation: A small batch of Support Edges (ground truth) is revealed.
+
+Evolution: The model trains on the support edges and adds them to the global Information Base for future proteins to use.
+
+3. Phase 2: The Inductive Leak (Multiplex Smoothing)
+
+We do not average neighbor affinities. Instead, we perform Chemical Footprinting.
+For every neighbor $P_{n}$ of the target, we construct a Binding Preference Vector $V_{pref}$ by projecting its known drug interactions into the MolCLR feature space:
+
+
+$$V_{pref} = \sum (\text{Drug\_Features} \times (pIC_{50} - \text{Baseline}))$$
+
+The Commonality Filter
+
+A cross-attention mechanism determines which neighbors "matter."
+
+If $P_{target}$ and $P_{n}$ share a rare structural pocket, the attention weight $\alpha$ is high.
+
+If they share a generic functional term but have different structures, $\alpha$ is low.
+The result is $Z_{refined}$, a protein latent representation that has "absorbed" the specific chemical likes and dislikes of its most relevant neighbors.
+
+4. Phase 3: The Trust-Aware Routing (The Gate)
+
+The model uses a Mixture-of-Experts (MoE). However, instead of a standard gate, we use a Trust-Aware Meta-Gate.
+The Router calculates the Variance of the neighbors on each multiplex floor:
+
+Low Variance = High Trust: Neighbors agree on what drugs bind; the signal is clean.
+
+High Variance = Low Trust: Neighbors disagree; the signal is noisy.
+
+The Gate looks at $[Z_{refined} \parallel \text{Trust}_{form} \parallel \text{Trust}_{role}]$ and routes the protein to one of $K$ specialized Expert Scorers. Each Expert acts as a different "Physics Engine," specializing in specific types of protein-ligand interactions (e.g., rigid-pocket vs. allosteric).
+
+5. Phase 4 & 5: Explanation-Based Learning (EBL)
+
+To prevent "Expert Collapse" (where the model only uses one expert), we implement Explanation-Based Learning (EBL).
+After the Support Labels are revealed, the model performs an Autopsy:
+
+It calculates which of the $K$ experts would have been the most accurate for this specific protein.
+
+It creates an "Oracle Distribution"—a target routing policy.
+
+It penalizes the Gate (via Cross-Entropy) for not picking the best expert.
+
+This forces the Gate to evolve its "Trust Policy," learning over time which biological signals are reliable and which are noise.
+
+6. Summary of Innovation
+
+Inductive: The model never "sees" the target protein's labels during evaluation; it must infer them from the topology.
+
+Multiplex: It differentiates between structural similarity and functional similarity.
+
+Dynamic: The Information Base grows with every episode, simulating a laboratory that gets smarter with every experiment.
