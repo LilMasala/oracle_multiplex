@@ -10,7 +10,12 @@ class MultiplexInductiveSmoother(nn.Module):
         self.drug_dim = drug_dim
         
         # Refiner to allow positioning to shift even without neighbors
-        self.prot_refiner = nn.Sequential(
+        self.form_refiner = nn.Sequential(
+            nn.Linear(protein_dim, protein_dim),
+            nn.PReLU(),
+            nn.Linear(protein_dim, protein_dim)
+        )
+        self.role_refiner = nn.Sequential(
             nn.Linear(protein_dim, protein_dim),
             nn.PReLU(),
             nn.Linear(protein_dim, protein_dim)
@@ -43,7 +48,7 @@ class MultiplexInductiveSmoother(nn.Module):
         )
         self.norm = nn.LayerNorm(protein_dim)
 
-    def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, drug_features):
+    def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, binds_w, drug_features):
         """
         The Dictionary Scan: Uses Cross-Attention so the target protein can 
         selectively pull the most relevant drug features from a neighbor's history.
@@ -52,7 +57,7 @@ class MultiplexInductiveSmoother(nn.Module):
         num_neighbors = neighbor_ids.size(0)
         messages = torch.zeros((num_neighbors, self.drug_dim), device=device)
         
-        if binds_ei.numel() == 0:
+        if binds_ei.numel() == 0 or neighbor_ids.numel() == 0:
             return messages 
             
         centered_y = binds_y - self.baseline
@@ -61,30 +66,42 @@ class MultiplexInductiveSmoother(nn.Module):
         # z_target is [protein_dim] -> Q is [1, drug_dim]
         Q = self.q_proj(z_target).unsqueeze(0) 
         
-        for i, n_idx in enumerate(neighbor_ids):
-            mask = binds_ei[0] == n_idx
-            if mask.any():
-                drug_idx = binds_ei[1][mask]
-                affinities = centered_y[mask]
-                d_feats = drug_features[drug_idx] # [N_drugs, drug_dim]
-                
-                # 2. Project the neighbor's drugs (The Keys and Values)
-                K = self.k_proj(d_feats) # [N_drugs, drug_dim]
-                
-                # We multiply the Values by the affinity so the model knows 
-                # if it was a strong bind or a strong rejection.
-                V = self.v_proj(d_feats) * affinities.unsqueeze(-1) # [N_drugs, drug_dim]
-                
-                # 3. Calculate "Dictionary" Match Scores (Dot Product Attention)
-                # How well does the target protein match each drug the neighbor saw?
-                scores = torch.matmul(Q, K.transpose(0, 1)) / math.sqrt(self.drug_dim) # [1, N_drugs]
-                
-                # Convert scores to probabilities (The "OH SHOOT LIKE THIS!" weights)
-                attn_weights = F.softmax(scores, dim=-1) # [1, N_drugs]
-                
-                # 4. Pull the relevant information
-                # Instead of a dumb average, we do a weighted sum based on relevance
-                messages[i] = torch.matmul(attn_weights, V).squeeze(0)
+        sorted_neighbors, inverse = torch.sort(neighbor_ids)
+        edge_src = binds_ei[0]
+        pos = torch.searchsorted(sorted_neighbors, edge_src)
+        clipped_pos = pos.clamp(max=max(sorted_neighbors.numel() - 1, 0))
+        valid = (pos < sorted_neighbors.numel()) & (sorted_neighbors[clipped_pos] == edge_src)
+        if not valid.any():
+            return messages
+
+        neighbor_pos = inverse[clipped_pos[valid]]
+        drug_idx = binds_ei[1][valid]
+        affinities = centered_y[valid]
+        reliabilities = binds_w[valid]
+
+        d_feats = drug_features[drug_idx]
+        K = self.k_proj(d_feats)
+        V = self.v_proj(d_feats) * (affinities * reliabilities).unsqueeze(-1)
+        scores = torch.matmul(K, Q.squeeze(0)) / math.sqrt(self.drug_dim)
+
+        sort_idx = torch.argsort(neighbor_pos)
+        sorted_neighbors_pos = neighbor_pos[sort_idx]
+        sorted_scores = scores[sort_idx]
+        sorted_v = V[sort_idx]
+
+        _, lengths = torch.unique_consecutive(sorted_neighbors_pos, return_counts=True)
+        seg_max = torch.segment_reduce(sorted_scores, reduce="max", lengths=lengths)
+        centered = sorted_scores - torch.repeat_interleave(seg_max, lengths)
+        exp_scores = torch.exp(centered)
+        seg_sum = torch.segment_reduce(exp_scores, reduce="sum", lengths=lengths)
+        attn = exp_scores / (torch.repeat_interleave(seg_sum, lengths) + 1e-12)
+
+        weighted_v = sorted_v * attn.unsqueeze(-1)
+        messages.scatter_add_(
+            0,
+            sorted_neighbors_pos.unsqueeze(-1).expand(-1, self.drug_dim),
+            weighted_v,
+        )
                 
         return messages
 
@@ -102,18 +119,20 @@ class MultiplexInductiveSmoother(nn.Module):
 
     def forward(self, pillar_data, drug_features):
         # 1. Align the latent spaces!
-        z_target_refined = self.prot_refiner(pillar_data["target_features"])
-        form_feats_refined = self.prot_refiner(pillar_data["form_features"])
-        role_feats_refined = self.prot_refiner(pillar_data["role_features"])
+        z_target_form = self.form_refiner(pillar_data["target_features"])
+        z_target_role = self.role_refiner(pillar_data["target_features"])
+        z_target_refined = 0.5 * (z_target_form + z_target_role)
+        form_feats_refined = self.form_refiner(pillar_data["form_features"])
+        role_feats_refined = self.role_refiner(pillar_data["role_features"])
         
         # 2. Run the Dictionary Scan (Notice we now pass z_target_refined)
         form_msgs = self._build_preference_vectors(
             z_target_refined, pillar_data["form_neighbors"], 
-            pillar_data["form_binds_ei"], pillar_data["form_binds_y"], drug_features
+            pillar_data["form_binds_ei"], pillar_data["form_binds_y"], pillar_data["form_binds_w"], drug_features
         )
         role_msgs = self._build_preference_vectors(
             z_target_refined, pillar_data["role_neighbors"], 
-            pillar_data["role_binds_ei"], pillar_data["role_binds_y"], drug_features
+            pillar_data["role_binds_ei"], pillar_data["role_binds_y"], pillar_data["role_binds_w"], drug_features
         )
         
         # 3. Apply the Global Floor Filter
@@ -124,7 +143,10 @@ class MultiplexInductiveSmoother(nn.Module):
         all_attn = torch.cat([form_attn, role_attn], dim=0)
         
         if all_msgs.size(0) == 0:
-            return self.norm(z_target_refined), form_msgs, role_msgs
+            return self.norm(z_target_refined), form_msgs, role_msgs, {
+                "form_attn": torch.empty((0,), device=z_target_refined.device),
+                "role_attn": torch.empty((0,), device=z_target_refined.device),
+            }
             
         attn_weights = F.softmax(all_attn, dim=0)
         v_prior = torch.sum(attn_weights * all_msgs, dim=0)
@@ -132,4 +154,7 @@ class MultiplexInductiveSmoother(nn.Module):
         # 4. Final Inductive Mix
         z_refined = self.norm(z_target_refined + self.integration_mlp(v_prior))
         
-        return z_refined, form_msgs, role_msgs
+        return z_refined, form_msgs, role_msgs, {
+            "form_attn": F.softmax(form_attn.squeeze(-1), dim=0) if form_attn.numel() else torch.empty((0,), device=z_refined.device),
+            "role_attn": F.softmax(role_attn.squeeze(-1), dim=0) if role_attn.numel() else torch.empty((0,), device=z_refined.device),
+        }

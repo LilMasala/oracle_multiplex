@@ -66,11 +66,12 @@ def run_sanity_check():
     print("\n[Phase 5] Running the Autopsy (EBL Loss on Support Data)...")
     support_preds, sup_gate_probs, sup_expert_tensor = model(pillar, data["drug"].x, support_drug_indices)
     
-    total_loss, mse, gate_penalty = loss_fn(support_preds, true_support_labels, sup_gate_probs, sup_expert_tensor)
-    
-    print(f"  Total Loss: {total_loss.item():.4f}")
-    print(f"  --> Base MSE: {mse:.4f}")
-    print(f"  --> Gate Routing Penalty: {gate_penalty:.4f}")
+    losses = loss_fn(support_preds, true_support_labels, sup_gate_probs, sup_expert_tensor)
+
+    print(f"  Total Loss: {losses['total_loss'].item():.4f}")
+    print(f"  --> Expert Loss: {losses['expert_loss'].item():.4f}")
+    print(f"  --> Gate Routing Penalty: {losses['gate_loss'].item():.4f}")
+    print(f"  --> Rank Loss: {losses['rank_loss'].item():.4f}")
     
     print("\n✅ PIPELINE SURVIVED! TENSORS ALIGNED PERFECTLY.")
 

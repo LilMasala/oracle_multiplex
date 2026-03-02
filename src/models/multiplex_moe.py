@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class MultiplexMoE(nn.Module):
     def __init__(self, smoother, router):
         super().__init__()
@@ -8,14 +9,14 @@ class MultiplexMoE(nn.Module):
         self.router = router
 
     def forward(self, pillar_data, drug_features, target_drug_indices):
-        # 1. Phase 2: Get the Refined Identity AND the raw footprints
-        z_refined, form_footprints, role_footprints = self.smoother(pillar_data, drug_features)
-        
-        # 2. Extract the features for the specific drugs we are ranking
+        z_refined, form_footprints, role_footprints, floor_stats = self.smoother(pillar_data, drug_features)
         target_drug_feats = drug_features[target_drug_indices]
-        
-        # 3. Phase 3: Route and Score
         scores, gate_probs, expert_tensor = self.router(
-            z_refined, form_footprints, role_footprints, target_drug_feats
+            z_refined,
+            form_footprints,
+            role_footprints,
+            target_drug_feats,
+            floor_stats=floor_stats,
+            cross_floor_jaccard=pillar_data.get("cross_floor_jaccard", torch.tensor(0.0, device=z_refined.device)),
         )
         return scores, gate_probs, expert_tensor
