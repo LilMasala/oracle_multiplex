@@ -1,160 +1,162 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+from torch_geometric.utils import scatter
+
 
 class MultiplexInductiveSmoother(nn.Module):
-    def __init__(self, protein_dim, drug_dim, baseline_pic50=6.0):
+    """
+    Multiplex smoother with hierarchical fusion:
+      1) Build neighbor preference vectors per layer.
+      2) Intra-layer attention aggregation -> v_form, v_role.
+      3) Inter-layer mixer with trust priors -> v_prior.
+    """
+
+    def __init__(self, protein_dim, drug_dim, trust_dim=3, baseline_pic50=6.0):
         super().__init__()
         self.baseline = baseline_pic50
         self.drug_dim = drug_dim
-        
-        # Refiner to allow positioning to shift even without neighbors
+
         self.form_refiner = nn.Sequential(
             nn.Linear(protein_dim, protein_dim),
             nn.PReLU(),
-            nn.Linear(protein_dim, protein_dim)
+            nn.Linear(protein_dim, protein_dim),
         )
         self.role_refiner = nn.Sequential(
             nn.Linear(protein_dim, protein_dim),
             nn.PReLU(),
-            nn.Linear(protein_dim, protein_dim)
+            nn.Linear(protein_dim, protein_dim),
         )
-        
-        # --- NEW: CROSS-ATTENTION DICTIONARY SCANNERS ---
-        # Query: The target protein looking for relevant chemical features
+
         self.q_proj = nn.Linear(protein_dim, drug_dim)
-        # Key: The drug features in the neighbor's history
         self.k_proj = nn.Linear(drug_dim, drug_dim)
-        # Value: What we actually extract (drug features scaled by affinity)
         self.v_proj = nn.Linear(drug_dim, drug_dim)
-        
-        self.layer_emb = nn.Embedding(2, 16) 
-        
-        # Deeper attn_net for complex similarities (The Floor Filter)
+
+        self.layer_emb = nn.Embedding(2, 16)
         attn_in_dim = (protein_dim * 2) + 16
         self.attn_net = nn.Sequential(
             nn.Linear(attn_in_dim, 128),
             nn.LeakyReLU(0.2),
             nn.Linear(128, 64),
             nn.LeakyReLU(0.2),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
-        
+
+        # Cross-layer mixer: [v_form, v_role, trust_vector] -> [w_form, w_role]
+        self.layer_mixer = nn.Sequential(
+            nn.Linear((2 * drug_dim) + trust_dim, 64),
+            nn.PReLU(),
+            nn.Linear(64, 2),
+        )
+
         self.integration_mlp = nn.Sequential(
             nn.Linear(drug_dim, protein_dim),
             nn.PReLU(),
-            nn.Linear(protein_dim, protein_dim)
+            nn.Linear(protein_dim, protein_dim),
         )
         self.norm = nn.LayerNorm(protein_dim)
 
     def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, binds_w, drug_features):
-        """
-        The Dictionary Scan: Uses Cross-Attention so the target protein can 
-        selectively pull the most relevant drug features from a neighbor's history.
-        """
         device = drug_features.device
         num_neighbors = neighbor_ids.size(0)
         messages = torch.zeros((num_neighbors, self.drug_dim), device=device)
-        
-        if binds_ei.numel() == 0 or neighbor_ids.numel() == 0:
-            return messages 
-            
-        centered_y = binds_y - self.baseline
-        
-        # 1. Project the Target Protein into the search space (The Query)
-        # z_target is [protein_dim] -> Q is [1, drug_dim]
-        Q = self.q_proj(z_target).unsqueeze(0) 
-        
+        if num_neighbors == 0 or binds_ei.numel() == 0:
+            return messages
+
         sorted_neighbors, inverse = torch.sort(neighbor_ids)
         edge_src = binds_ei[0]
         pos = torch.searchsorted(sorted_neighbors, edge_src)
-        clipped_pos = pos.clamp(max=max(sorted_neighbors.numel() - 1, 0))
-        valid = (pos < sorted_neighbors.numel()) & (sorted_neighbors[clipped_pos] == edge_src)
+        clipped = pos.clamp(max=max(sorted_neighbors.numel() - 1, 0))
+        valid = (pos < sorted_neighbors.numel()) & (sorted_neighbors[clipped] == edge_src)
         if not valid.any():
             return messages
 
-        neighbor_pos = inverse[clipped_pos[valid]]
+        neighbor_pos = inverse[clipped[valid]]
         drug_idx = binds_ei[1][valid]
-        affinities = centered_y[valid]
+        affinities = (binds_y[valid] - self.baseline)
         reliabilities = binds_w[valid]
 
+        q = self.q_proj(z_target).view(1, -1)
         d_feats = drug_features[drug_idx]
-        K = self.k_proj(d_feats)
-        V = self.v_proj(d_feats) * (affinities * reliabilities).unsqueeze(-1)
-        scores = torch.matmul(K, Q.squeeze(0)) / math.sqrt(self.drug_dim)
+        k = self.k_proj(d_feats)
+        v = self.v_proj(d_feats) * (affinities * reliabilities).unsqueeze(-1)
+        logits = torch.matmul(k, q.t()).squeeze(-1) / math.sqrt(self.drug_dim)
 
-        sort_idx = torch.argsort(neighbor_pos)
-        sorted_neighbors_pos = neighbor_pos[sort_idx]
-        sorted_scores = scores[sort_idx]
-        sorted_v = V[sort_idx]
+        # Softmax by neighbor group using scatter primitives.
+        max_per_neighbor = scatter(logits, neighbor_pos, dim=0, dim_size=num_neighbors, reduce="max")
+        centered = logits - max_per_neighbor[neighbor_pos]
+        exp_logits = torch.exp(centered)
+        denom = scatter(exp_logits, neighbor_pos, dim=0, dim_size=num_neighbors, reduce="sum") + 1e-12
+        attn = exp_logits / denom[neighbor_pos]
 
-        _, lengths = torch.unique_consecutive(sorted_neighbors_pos, return_counts=True)
-        seg_max = torch.segment_reduce(sorted_scores, reduce="max", lengths=lengths)
-        centered = sorted_scores - torch.repeat_interleave(seg_max, lengths)
-        exp_scores = torch.exp(centered)
-        seg_sum = torch.segment_reduce(exp_scores, reduce="sum", lengths=lengths)
-        attn = exp_scores / (torch.repeat_interleave(seg_sum, lengths) + 1e-12)
-
-        weighted_v = sorted_v * attn.unsqueeze(-1)
-        messages.scatter_add_(
-            0,
-            sorted_neighbors_pos.unsqueeze(-1).expand(-1, self.drug_dim),
-            weighted_v,
-        )
-                
+        weighted_v = v * attn.unsqueeze(-1)
+        messages = scatter(weighted_v, neighbor_pos, dim=0, dim_size=num_neighbors, reduce="sum")
         return messages
 
     def _compute_attention(self, z_target, z_neighbors, layer_id):
         num_neighbors = z_neighbors.size(0)
         if num_neighbors == 0:
-            return torch.empty((0, 1), device=z_target.device)
-            
+            return torch.empty((0,), device=z_target.device)
+
         z_target_exp = z_target.unsqueeze(0).expand(num_neighbors, -1)
         l_emb = self.layer_emb(torch.tensor([layer_id], device=z_target.device)).expand(num_neighbors, -1)
-        
         attn_input = torch.cat([z_target_exp, z_neighbors, l_emb], dim=-1)
-        raw_scores = self.attn_net(attn_input)
-        return raw_scores
+        return self.attn_net(attn_input).squeeze(-1)
+
+    def _aggregate_layer(self, msgs, attn_logits, diff_w):
+        if msgs.size(0) == 0:
+            return torch.zeros((self.drug_dim,), device=msgs.device), torch.empty((0,), device=msgs.device)
+
+        if diff_w.numel() == msgs.size(0):
+            attn_logits = attn_logits + torch.log(diff_w.clamp_min(1e-12))
+        attn = F.softmax(attn_logits, dim=0)
+        v_layer = (attn.unsqueeze(-1) * msgs).sum(dim=0)
+        return v_layer, attn
 
     def forward(self, pillar_data, drug_features):
-        # 1. Align the latent spaces!
         z_target_form = self.form_refiner(pillar_data["target_features"])
         z_target_role = self.role_refiner(pillar_data["target_features"])
         z_target_refined = 0.5 * (z_target_form + z_target_role)
+
         form_feats_refined = self.form_refiner(pillar_data["form_features"])
         role_feats_refined = self.role_refiner(pillar_data["role_features"])
-        
-        # 2. Run the Dictionary Scan (Notice we now pass z_target_refined)
+
         form_msgs = self._build_preference_vectors(
-            z_target_refined, pillar_data["form_neighbors"], 
-            pillar_data["form_binds_ei"], pillar_data["form_binds_y"], pillar_data["form_binds_w"], drug_features
+            z_target_refined,
+            pillar_data["form_neighbors"],
+            pillar_data["form_binds_ei"],
+            pillar_data["form_binds_y"],
+            pillar_data["form_binds_w"],
+            drug_features,
         )
         role_msgs = self._build_preference_vectors(
-            z_target_refined, pillar_data["role_neighbors"], 
-            pillar_data["role_binds_ei"], pillar_data["role_binds_y"], pillar_data["role_binds_w"], drug_features
+            z_target_refined,
+            pillar_data["role_neighbors"],
+            pillar_data["role_binds_ei"],
+            pillar_data["role_binds_y"],
+            pillar_data["role_binds_w"],
+            drug_features,
         )
-        
-        # 3. Apply the Global Floor Filter
-        form_attn = self._compute_attention(z_target_refined, form_feats_refined, layer_id=0)
-        role_attn = self._compute_attention(z_target_refined, role_feats_refined, layer_id=1)
-        
-        all_msgs = torch.cat([form_msgs, role_msgs], dim=0)
-        all_attn = torch.cat([form_attn, role_attn], dim=0)
-        
-        if all_msgs.size(0) == 0:
-            return self.norm(z_target_refined), form_msgs, role_msgs, {
-                "form_attn": torch.empty((0,), device=z_target_refined.device),
-                "role_attn": torch.empty((0,), device=z_target_refined.device),
-            }
-            
-        attn_weights = F.softmax(all_attn, dim=0)
-        v_prior = torch.sum(attn_weights * all_msgs, dim=0)
-        
-        # 4. Final Inductive Mix
+
+        form_logits = self._compute_attention(z_target_refined, form_feats_refined, layer_id=0)
+        role_logits = self._compute_attention(z_target_refined, role_feats_refined, layer_id=1)
+
+        v_form, form_attn = self._aggregate_layer(form_msgs, form_logits, pillar_data.get("form_diff_w", torch.empty(0, device=z_target_refined.device)))
+        v_role, role_attn = self._aggregate_layer(role_msgs, role_logits, pillar_data.get("role_diff_w", torch.empty(0, device=z_target_refined.device)))
+
+        trust_vector = pillar_data.get("trust_vector", torch.zeros(3, device=z_target_refined.device)).float()
+        mixer_in = torch.cat([v_form, v_role, trust_vector], dim=0).unsqueeze(0)
+        layer_weights = F.softmax(self.layer_mixer(mixer_in), dim=-1).squeeze(0)
+        w_form, w_role = layer_weights[0], layer_weights[1]
+
+        v_prior = (w_form * v_form) + (w_role * v_role)
         z_refined = self.norm(z_target_refined + self.integration_mlp(v_prior))
-        
-        return z_refined, form_msgs, role_msgs, {
-            "form_attn": F.softmax(form_attn.squeeze(-1), dim=0) if form_attn.numel() else torch.empty((0,), device=z_refined.device),
-            "role_attn": F.softmax(role_attn.squeeze(-1), dim=0) if role_attn.numel() else torch.empty((0,), device=z_refined.device),
+
+        floor_stats = {
+            "form_attn": form_attn,
+            "role_attn": role_attn,
+            "w_form": w_form.detach(),
+            "w_role": w_role.detach(),
         }
+        return z_refined, v_prior, floor_stats

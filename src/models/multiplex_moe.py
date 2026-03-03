@@ -9,14 +9,15 @@ class MultiplexMoE(nn.Module):
         self.router = router
 
     def forward(self, pillar_data, drug_features, target_drug_indices):
-        z_refined, form_footprints, role_footprints, floor_stats = self.smoother(pillar_data, drug_features)
+        z_refined, v_prior, floor_stats = self.smoother(pillar_data, drug_features)
         target_drug_feats = drug_features[target_drug_indices]
+
+        trust_vector = pillar_data.get("trust_vector", torch.zeros(3, device=z_refined.device))
         scores, gate_probs, expert_tensor = self.router(
-            z_refined,
-            form_footprints,
-            role_footprints,
-            target_drug_feats,
-            floor_stats=floor_stats,
-            cross_floor_jaccard=pillar_data.get("cross_floor_jaccard", torch.tensor(0.0, device=z_refined.device)),
+            z_refined=z_refined,
+            protein_raw_features=pillar_data["target_features"],
+            v_prior=v_prior,
+            query_drug_features=target_drug_feats,
+            trust_vector=trust_vector,
         )
         return scores, gate_probs, expert_tensor
