@@ -51,9 +51,9 @@ class EBLLoss(nn.Module):
         # logistic pairwise ranking surrogate for CI maximization
         return F.softplus(-margins).mean()
 
-    def forward(self, final_preds, true_labels, gate_probs, expert_tensor):
-        mse_per_expert = (expert_tensor - true_labels.unsqueeze(1)) ** 2
-        mean_mse = mse_per_expert.mean(dim=0, keepdim=True)
+    def forward(self, final_preds, true_labels, gate_probs, expert_tensor, protein_level_gate=False):
+        mse_per_expert = (expert_tensor - true_labels.unsqueeze(1)) ** 2  # [N, K]
+        mean_mse = mse_per_expert.mean(dim=0, keepdim=True)  # [1, K]
 
         with torch.no_grad():
             raw_target_probs = F.softmax(-mean_mse / self.temperature, dim=-1)
@@ -64,7 +64,14 @@ class EBLLoss(nn.Module):
         lambda_loss = self._compute_lambda_ci_loss(final_preds, true_labels)
         ranking_loss = listnet_loss + self.lambda_rank_weight * lambda_loss
 
-        gate_loss = -torch.sum(target_gate_probs * torch.log(gate_probs + 1e-12), dim=-1).mean()
+        if protein_level_gate:
+            # Gate loss is computed once per protein episode: [1, K] vs [1, K].
+            protein_gate_probs = gate_probs[:1]
+            gate_loss = -torch.sum(target_gate_probs * torch.log(protein_gate_probs + 1e-12), dim=-1).mean()
+        else:
+            # Backward-compatible behavior for per-example gate outputs [N, K].
+            gate_loss = -torch.sum(target_gate_probs * torch.log(gate_probs + 1e-12), dim=-1).mean()
+
         expert_loss = torch.sum(mean_mse * target_gate_probs.detach(), dim=-1).mean()
         total_loss = expert_loss + (self.ebl_alpha * gate_loss) + (self.rank_weight * ranking_loss)
 
