@@ -92,11 +92,11 @@ def run_noise_test():
         # --- ZERO-SHOT EVALUATION (THE BLINDFOLD) ---
         pillar = loader.get_pillar_context(prot_idx)
         with torch.no_grad():
-            query_preds, _, _ = model(pillar, data["drug"].x, query_edges[1])
+            query_preds, _, _, _ = model(pillar, data["drug"].x, query_edges[1])
             query_mse = F.mse_loss(query_preds, query_labels).item()
 
         # --- SUPPORT TRAINING (THE AUTOPSY) ---
-        support_preds, gate_probs, expert_tensor = model(pillar, data["drug"].x, support_edges[1])
+        support_preds, gate_probs, expert_tensor, _ = model(pillar, data["drug"].x, support_edges[1])
         losses = loss_fn(support_preds, support_labels, gate_probs, expert_tensor)
 
         losses["total_loss"].backward()

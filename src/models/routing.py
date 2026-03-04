@@ -10,8 +10,10 @@ from torch.distributions import constraints
 class ExpertScorer(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim=256, dropout=0.2):
         super().__init__()
-        self.p_proj = nn.Linear(protein_dim, hidden_dim)
-        self.d_proj = nn.Linear(drug_dim, hidden_dim)
+        # z_p input shape: [N, protein_dim + 2 * drug_dim] where context=[v_prior, delta_mean]
+        self.p_proj = nn.Linear((2 * protein_dim) + drug_dim, hidden_dim)
+        # z_d input shape: [N, drug_dim + 2 * drug_dim] after concatenating [drug_emb, v_prior, delta_mean]
+        self.d_proj = nn.Linear((2 * drug_dim) + protein_dim, hidden_dim)
         self.interaction = nn.Bilinear(hidden_dim, hidden_dim, hidden_dim)
         self.mlp = nn.Sequential(
             nn.PReLU(),
@@ -33,28 +35,31 @@ class ExpertScorer(nn.Module):
 class MultiplexMoEGate(nn.Module):
     """
     Trust-aware gate.
-    Input = [protein_raw_features, v_prior, trust_vector].
+    Input = [z_t, v_prior, delta_mean, trust_vector].
     """
 
     def __init__(self, protein_dim, drug_dim, trust_dim, num_experts, hidden_dim=128, top_k=2):
         super().__init__()
         self.top_k = top_k
         self.router = nn.Sequential(
-            nn.Linear(protein_dim + drug_dim + trust_dim, hidden_dim),
+            nn.Linear((2 * protein_dim) + drug_dim + trust_dim, hidden_dim),
             nn.PReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, num_experts),
         )
 
-    def forward(self, protein_raw, v_prior, trust_vector):
-        if protein_raw.dim() == 1:
-            protein_raw = protein_raw.unsqueeze(0)
+    def forward(self, z_t, v_prior, delta_mean, trust_vector):
+        if z_t.dim() == 1:
+            z_t = z_t.unsqueeze(0)
         if v_prior.dim() == 1:
             v_prior = v_prior.unsqueeze(0)
+        if delta_mean.dim() == 1:
+            delta_mean = delta_mean.unsqueeze(0)
         if trust_vector.dim() == 1:
             trust_vector = trust_vector.unsqueeze(0)
 
-        gate_input = torch.cat([protein_raw, v_prior, trust_vector], dim=-1)
+        # gate_input: [B, 2*protein_dim + drug_dim + trust_dim]
+        gate_input = torch.cat([z_t, v_prior, delta_mean, trust_vector], dim=-1)
         logits = self.router(gate_input)
 
         k = min(self.top_k, logits.size(-1))
@@ -79,12 +84,18 @@ class MultiplexRoutingHead(nn.Module):
         )
         self.experts = nn.ModuleList([ExpertScorer(protein_dim, drug_dim) for _ in range(num_experts)])
 
-    def forward(self, z_refined, protein_raw_features, v_prior, query_drug_features, trust_vector):
+    def forward(self, z_refined, protein_raw_features, v_prior, delta_mean, query_drug_features, trust_vector):
         if z_refined.dim() == 1:
             z_refined = z_refined.unsqueeze(0)
 
-        gate_probs = self.gate(protein_raw_features, v_prior, trust_vector)
-        expert_predictions = [expert(z_refined, query_drug_features) for expert in self.experts]
+        gate_probs = self.gate(protein_raw_features, v_prior, delta_mean, trust_vector)
+
+        num_queries = query_drug_features.size(0)
+        prior_rep = v_prior.unsqueeze(0).expand(num_queries, -1)
+        delta_rep = delta_mean.unsqueeze(0).expand(num_queries, -1)
+        expert_protein_input = torch.cat([z_refined.expand(num_queries, -1), prior_rep, delta_rep], dim=-1)
+        expert_drug_input = torch.cat([query_drug_features, prior_rep, delta_rep], dim=-1)
+        expert_predictions = [expert(expert_protein_input, expert_drug_input) for expert in self.experts]
         expert_tensor = torch.stack(expert_predictions, dim=1)
         final_scores = torch.sum(expert_tensor * gate_probs, dim=-1)
         return final_scores, gate_probs, expert_tensor
@@ -94,7 +105,7 @@ class BayesianMultiplexRouter(PyroModule):
     """
     Truncated stick-breaking DPMM router with deterministic experts.
 
-    - Generative model observes concatenated context [protein_raw, v_prior, trust_vector].
+    - Generative model observes concatenated context [z_t, v_prior, delta_mean, trust_vector].
     - Routing is computed once at protein-level; broadcast only for expert score aggregation.
     """
 
@@ -117,7 +128,7 @@ class BayesianMultiplexRouter(PyroModule):
         self.top_k = top_k
         self.dp_concentration = dp_concentration
 
-        self.router_input_dim = protein_dim + drug_dim + trust_dim
+        self.router_input_dim = (2 * protein_dim) + drug_dim + trust_dim
         self.router_net = PyroModule[nn.Sequential](
             nn.Linear(self.router_input_dim, hidden_dim),
             nn.PReLU(),
@@ -155,18 +166,21 @@ class BayesianMultiplexRouter(PyroModule):
             logits = sparse_logits
         return F.softmax(logits, dim=-1)
 
-    def _router_input(self, protein_raw, v_prior, trust_vector):
-        if protein_raw.dim() == 1:
-            protein_raw = protein_raw.unsqueeze(0)
+    def _router_input(self, z_t, v_prior, delta_mean, trust_vector):
+        if z_t.dim() == 1:
+            z_t = z_t.unsqueeze(0)
         if v_prior.dim() == 1:
             v_prior = v_prior.unsqueeze(0)
+        if delta_mean.dim() == 1:
+            delta_mean = delta_mean.unsqueeze(0)
         if trust_vector.dim() == 1:
             trust_vector = trust_vector.unsqueeze(0)
-        return torch.cat([protein_raw, v_prior, trust_vector], dim=-1)
+        # router input: [B, 2*protein_dim + drug_dim + trust_dim]
+        return torch.cat([z_t, v_prior, delta_mean, trust_vector], dim=-1)
 
-    def model(self, protein_raw, v_prior, trust_vector):
+    def model(self, z_t, v_prior, delta_mean, trust_vector):
         pyro.module("bayesian_router", self)
-        obs_x = self._router_input(protein_raw, v_prior, trust_vector)
+        obs_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)
 
         alpha = obs_x.new_tensor(self.dp_concentration)
         beta = pyro.sample(
@@ -186,8 +200,8 @@ class BayesianMultiplexRouter(PyroModule):
                 obs=obs_x,
             )
 
-    def guide(self, protein_raw, v_prior, trust_vector):
-        obs_x = self._router_input(protein_raw, v_prior, trust_vector)
+    def guide(self, z_t, v_prior, delta_mean, trust_vector):
+        obs_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)
 
         beta = pyro.sample("beta", dist.Beta(self.q_beta_a, self.q_beta_b).to_event(1))
         stick_weights = self._stick_breaking(beta)
@@ -204,9 +218,9 @@ class BayesianMultiplexRouter(PyroModule):
         beta_mean = self.q_beta_a / (self.q_beta_a + self.q_beta_b + 1e-8)
         return self._stick_breaking(beta_mean)
 
-    def route_probs(self, protein_raw, v_prior, trust_vector):
+    def route_probs(self, z_t, v_prior, delta_mean, trust_vector):
         """Protein-level routing probabilities. Returns shape [1, K]."""
-        obs_x = self._router_input(protein_raw, v_prior, trust_vector)[:1]
+        obs_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)[:1]
         logits = self.router_net(obs_x)
         local_probs = self._masked_softmax(logits)
 
@@ -215,12 +229,18 @@ class BayesianMultiplexRouter(PyroModule):
         probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
         return probs
 
-    def forward(self, z_refined, protein_raw_features, v_prior, query_drug_features, trust_vector):
+    def forward(self, z_refined, protein_raw_features, v_prior, delta_mean, query_drug_features, trust_vector):
         if z_refined.dim() == 1:
             z_refined = z_refined.unsqueeze(0)
 
-        protein_gate_probs = self.route_probs(protein_raw_features, v_prior, trust_vector)
-        expert_predictions = [expert(z_refined, query_drug_features) for expert in self.experts]
+        protein_gate_probs = self.route_probs(protein_raw_features, v_prior, delta_mean, trust_vector)
+
+        num_queries = query_drug_features.size(0)
+        prior_rep = v_prior.unsqueeze(0).expand(num_queries, -1)
+        delta_rep = delta_mean.unsqueeze(0).expand(num_queries, -1)
+        expert_protein_input = torch.cat([z_refined.expand(num_queries, -1), prior_rep, delta_rep], dim=-1)
+        expert_drug_input = torch.cat([query_drug_features, prior_rep, delta_rep], dim=-1)
+        expert_predictions = [expert(expert_protein_input, expert_drug_input) for expert in self.experts]
         expert_tensor = torch.stack(expert_predictions, dim=1)
 
         # [N, K] * [1, K] -> [N, K], keeping a single protein-level gate decision.

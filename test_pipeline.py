@@ -58,13 +58,13 @@ def run_sanity_check():
 
     print("\n[Phase 2 & 3] Running the Inductive Leak & MoE Gate (Zero-Shot Eval)...")
     # We pass the full drug matrix so the Smoother can build the chemical footprints
-    query_preds, gate_probs, _ = model(pillar, data["drug"].x, query_drug_indices)
+    query_preds, gate_probs, _, _ = model(pillar, data["drug"].x, query_drug_indices)
     
     print(f"  Gate Probabilities (Routing): {gate_probs.detach().cpu().numpy()}")
     print(f"  Predicted pIC50s for {len(query_drug_indices)} Query Drugs: {query_preds.shape}")
 
     print("\n[Phase 5] Running the Autopsy (EBL Loss on Support Data)...")
-    support_preds, sup_gate_probs, sup_expert_tensor = model(pillar, data["drug"].x, support_drug_indices)
+    support_preds, sup_gate_probs, sup_expert_tensor, _ = model(pillar, data["drug"].x, support_drug_indices)
     
     losses = loss_fn(support_preds, true_support_labels, sup_gate_probs, sup_expert_tensor)
 

@@ -56,6 +56,8 @@ class MultiplexInductiveSmoother(nn.Module):
             nn.Linear(protein_dim, protein_dim),
         )
         self.norm = nn.LayerNorm(protein_dim)
+        self.delta_norm = nn.LayerNorm(protein_dim, elementwise_affine=False)
+        self.delta_gate = nn.Parameter(torch.tensor(0.0))
 
     def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, binds_w, drug_features):
         device = drug_features.device
@@ -114,6 +116,13 @@ class MultiplexInductiveSmoother(nn.Module):
         v_layer = (attn.unsqueeze(-1) * msgs).sum(dim=0)
         return v_layer, attn
 
+    def _aggregate_delta_layer(self, z_target, z_neighbors, attn):
+        # z_target: [protein_dim], z_neighbors: [N_neighbors, protein_dim], attn: [N_neighbors]
+        if z_neighbors.size(0) == 0:
+            return torch.zeros_like(z_target)
+        delta_neighbors = z_target.unsqueeze(0) - z_neighbors
+        return (attn.unsqueeze(-1) * delta_neighbors).sum(dim=0)
+
     def forward(self, pillar_data, drug_features):
         z_target_form = self.form_refiner(pillar_data["target_features"])
         z_target_role = self.role_refiner(pillar_data["target_features"])
@@ -151,6 +160,13 @@ class MultiplexInductiveSmoother(nn.Module):
         w_form, w_role = layer_weights[0], layer_weights[1]
 
         v_prior = (w_form * v_form) + (w_role * v_role)
+
+        # Delta channel over same neighborhood sets used for v_prior.
+        form_delta = self._aggregate_delta_layer(z_target_refined, form_feats_refined, form_attn)
+        role_delta = self._aggregate_delta_layer(z_target_refined, role_feats_refined, role_attn)
+        delta_raw = (w_form * form_delta) + (w_role * role_delta)
+        delta_mean = self.delta_gate * self.delta_norm(delta_raw)
+
         z_refined = self.norm(z_target_refined + self.integration_mlp(v_prior))
 
         floor_stats = {
@@ -158,5 +174,6 @@ class MultiplexInductiveSmoother(nn.Module):
             "role_attn": role_attn,
             "w_form": w_form.detach(),
             "w_role": w_role.detach(),
+            "delta_norm": delta_mean.norm(p=2).detach(),
         }
-        return z_refined, v_prior, floor_stats
+        return z_refined, v_prior, delta_mean, floor_stats
