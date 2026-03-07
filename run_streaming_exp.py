@@ -2,14 +2,16 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+import pyro
 from torch.optim import Adam
 
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.protocol.prequential import build_multiplex_stream
 from src.models.smoothing import MultiplexInductiveSmoother
-from src.models.routing import MultiplexRoutingHead
+from src.models.routing import BayesianMultiplexRouter
 from src.models.multiplex_moe import MultiplexMoE
 from src.training.ebl_loss import EBLLoss
+from src.training.bayesian_training import build_router_elbo
 from src.training.metrics import calculate_ci, calculate_ef_at_k
 
 
@@ -80,15 +82,18 @@ def main():
 
     prot_dim = data["protein"].x.size(1)
     drug_dim = data["drug"].x.size(1)
-    num_experts, lr = 4, 5e-4
+    lr = 5e-4
+    elbo_weight = 0.1
 
     loader = MultiplexPillarSampler(data, binds_metric="binds_activity", priors_cache_path="data/multiplex_priors.pt")
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
     print(f"🧬 Stream built: {len(episodes)} protein episodes ready.")
 
     smoother = MultiplexInductiveSmoother(prot_dim, drug_dim).to(device)
-    router = MultiplexRoutingHead(prot_dim, drug_dim, num_experts).to(device)
+    pyro.clear_param_store()
+    router = BayesianMultiplexRouter(prot_dim, drug_dim, max_experts=16).to(device)
     model = MultiplexMoE(smoother, router).to(device)
+    elbo = build_router_elbo()
 
     optimizer = Adam(model.parameters(), lr=lr)
     loss_fn = EBLLoss(ebl_alpha=0.3, temperature=0.1, eps=0.15, rank_weight=0.3)
@@ -131,6 +136,21 @@ def main():
         model.train()
         optimizer.zero_grad()
         loss_fn.step_schedule(i, len(episodes))
+
+        # ELBO pass — once per episode at protein level, accumulates into the same
+        # gradient graph as the supervised mini-batch losses below.
+        z_ep, v_ep, delta_ep, _ = model.smoother(pillar, data["drug"].x)
+        trust_ep = pillar.get("trust_vector", torch.zeros(5, device=device)).float()
+        elbo_loss = elbo.differentiable_loss(
+            model.router.model,
+            model.router.guide,
+            pillar["target_features"],
+            v_ep,
+            delta_ep,
+            trust_ep,
+        )
+        (elbo_weight * elbo_loss).backward()
+        elbo_loss_val = float(elbo_loss.detach().item())
 
         rank_losses = []
         replay_losses = []
@@ -202,6 +222,7 @@ def main():
                 "delta_norm": delta_norm,
                 "current_loss": current_loss,
                 "replay_loss": replay_loss,
+                "elbo_loss": elbo_loss_val,
             }
         )
 
@@ -209,6 +230,7 @@ def main():
             print(
                 f"Ep {i:03d} | {uniprot_id} | CI: {ci_val:.3f} | EF10: {ef10_val:.2f} "
                 f"| ||delta||: {delta_norm:.3f} | current_loss: {current_loss:.3f} | replay_loss: {replay_loss:.3f} "
+                f"| elbo: {elbo_loss_val:.3f} "
                 f"| n={n_preds} pos>=6:{n_pos_ge6} ({pos_rate_ge6:.2%}) pos>=7:{n_pos_ge7} ({pos_rate_ge7:.2%}) "
                 f"| Expert: {winning_expert}"
             )

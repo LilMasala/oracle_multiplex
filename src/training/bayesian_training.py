@@ -1,13 +1,20 @@
 import pyro
-from pyro.infer import TraceMeanField_ELBO
+from pyro.infer import Trace_ELBO
 
 
-def build_router_elbo(num_particles=1):
-    """Create ELBO object used in unified differentiable optimization."""
-    # Caller is responsible for clearing the param store at initialization time if needed;
-    # doing so here would silently reset learned variational parameters (q_beta_a, q_beta_b,
-    # component_loc, component_scale) if called after training has started.
-    return TraceMeanField_ELBO(num_particles=num_particles)
+def build_router_elbo(num_particles=4):
+    """Create ELBO object used in unified differentiable optimization.
+
+    Uses Trace_ELBO (vs TraceMeanField_ELBO) because the guide contains
+    dist.Categorical for the cluster assignment z, which is discrete and
+    non-reparameterizable. Trace_ELBO handles discrete variables via the
+    score function (REINFORCE) estimator. num_particles > 1 reduces variance.
+
+    Caller is responsible for clearing the param store at initialization time if needed;
+    doing so here would silently reset learned variational parameters (q_beta_a, q_beta_b,
+    component_loc, component_scale) if called after training has started.
+    """
+    return Trace_ELBO(num_particles=num_particles)
 
 
 def train_stream_step_with_svi(
