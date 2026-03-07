@@ -13,9 +13,10 @@ class MultiplexInductiveSmoother(nn.Module):
       3) Inter-layer mixer with trust priors -> v_prior.
     """
 
-    def __init__(self, protein_dim, drug_dim, trust_dim=3, baseline_pic50=6.0):
+    def __init__(self, protein_dim, drug_dim, trust_dim=5, baseline_pic50=6.0):
         super().__init__()
         self.baseline = baseline_pic50
+        self.protein_dim = protein_dim
         self.drug_dim = drug_dim
 
         self.form_refiner = nn.Sequential(
@@ -57,13 +58,19 @@ class MultiplexInductiveSmoother(nn.Module):
         )
         self.norm = nn.LayerNorm(protein_dim)
         self.delta_norm = nn.LayerNorm(protein_dim, elementwise_affine=False)
-        self.delta_gate = nn.Parameter(torch.tensor(0.0))
+        self.delta_gate = nn.Parameter(torch.tensor(0.1))
+        self.form_role_gate = nn.Parameter(torch.tensor(0.5))
+        self.struct_to_drug_proj = nn.Linear(protein_dim, drug_dim)
+        self.centroid_to_drug = nn.Linear(protein_dim, drug_dim)
+        self.blend_tau = nn.Parameter(torch.tensor(10.0))
 
-    def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, binds_w, drug_features):
+    def _build_preference_vectors(self, z_target, neighbor_ids, binds_ei, binds_y, binds_w, drug_features, neighbor_features=None):
         device = drug_features.device
         num_neighbors = neighbor_ids.size(0)
         messages = torch.zeros((num_neighbors, self.drug_dim), device=device)
         if num_neighbors == 0 or binds_ei.numel() == 0:
+            if neighbor_features is not None and neighbor_features.size(0) > 0:
+                return self.struct_to_drug_proj(neighbor_features)  # [N_neighbors, drug_dim]
             return messages
 
         sorted_neighbors, inverse = torch.sort(neighbor_ids)
@@ -126,7 +133,8 @@ class MultiplexInductiveSmoother(nn.Module):
     def forward(self, pillar_data, drug_features):
         z_target_form = self.form_refiner(pillar_data["target_features"])
         z_target_role = self.role_refiner(pillar_data["target_features"])
-        z_target_refined = 0.5 * (z_target_form + z_target_role)
+        alpha = torch.sigmoid(self.form_role_gate)
+        z_target_refined = alpha * z_target_form + (1.0 - alpha) * z_target_role
 
         form_feats_refined = self.form_refiner(pillar_data["form_features"])
         role_feats_refined = self.role_refiner(pillar_data["role_features"])
@@ -138,6 +146,7 @@ class MultiplexInductiveSmoother(nn.Module):
             pillar_data["form_binds_y"],
             pillar_data["form_binds_w"],
             drug_features,
+            neighbor_features=form_feats_refined,
         )
         role_msgs = self._build_preference_vectors(
             z_target_refined,
@@ -146,6 +155,7 @@ class MultiplexInductiveSmoother(nn.Module):
             pillar_data["role_binds_y"],
             pillar_data["role_binds_w"],
             drug_features,
+            neighbor_features=role_feats_refined,
         )
 
         form_logits = self._compute_attention(z_target_refined, form_feats_refined, layer_id=0)
@@ -154,12 +164,21 @@ class MultiplexInductiveSmoother(nn.Module):
         v_form, form_attn = self._aggregate_layer(form_msgs, form_logits, pillar_data.get("form_diff_w", torch.empty(0, device=z_target_refined.device)))
         v_role, role_attn = self._aggregate_layer(role_msgs, role_logits, pillar_data.get("role_diff_w", torch.empty(0, device=z_target_refined.device)))
 
-        trust_vector = pillar_data.get("trust_vector", torch.zeros(3, device=z_target_refined.device)).float()
+        trust_vector = pillar_data.get("trust_vector", torch.zeros(5, device=z_target_refined.device)).float()
         mixer_in = torch.cat([v_form, v_role, trust_vector], dim=0).unsqueeze(0)
         layer_weights = F.softmax(self.layer_mixer(mixer_in), dim=-1).squeeze(0)
         w_form, w_role = layer_weights[0], layer_weights[1]
 
         v_prior = (w_form * v_form) + (w_role * v_role)
+
+        ppr_centroid = pillar_data.get("ppr_centroid")
+        if ppr_centroid is not None:
+            n_edges = pillar_data["form_binds_ei"].size(1) + pillar_data["role_binds_ei"].size(1)
+            tau = self.blend_tau.abs().clamp(min=1.0)
+            centroid_gate = torch.exp(
+                torch.tensor(-n_edges, dtype=torch.float32, device=v_prior.device) / tau
+            )
+            v_prior = (1.0 - centroid_gate) * v_prior + centroid_gate * self.centroid_to_drug(ppr_centroid)
 
         # Delta channel over same neighborhood sets used for v_prior.
         form_delta = self._aggregate_delta_layer(z_target_refined, form_feats_refined, form_attn)

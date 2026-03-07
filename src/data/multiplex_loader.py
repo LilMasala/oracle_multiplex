@@ -104,14 +104,32 @@ class MultiplexPillarSampler:
         decay = torch.exp(-self.temporal_decay * age)
         return n_binds_ei, n_binds_y, base_w * decay
 
-    def _build_trust_vector(self, target_idx):
+    def _build_trust_vector(self, target_idx, form_neighbors, role_neighbors):
         device = self.protein_x.device
+
+        # neighbor_binding_density: fraction of structural neighbors with any revealed binding edge
+        all_neighbors = torch.cat([form_neighbors, role_neighbors]).unique()
+        if all_neighbors.numel() > 0 and self.binds_ei.size(1) > 0:
+            n_sorted, _ = torch.sort(all_neighbors)
+            left = torch.searchsorted(self.bind_src_sorted, n_sorted, right=False)
+            right = torch.searchsorted(self.bind_src_sorted, n_sorted, right=True)
+            n_with_data = ((right - left) > 0).sum().item()
+            density = torch.tensor(n_with_data / all_neighbors.numel(), dtype=torch.float32, device=device)
+        else:
+            density = torch.tensor(0.0, device=device)
+
         if self.priors is not None:
+            if "mean_ppr_score" in self.priors:
+                mean_ppr = self.priors["mean_ppr_score"][target_idx].to(device).float()
+            else:
+                mean_ppr = torch.tensor(0.0, device=device)
             return torch.stack(
                 [
                     self.priors["participation_coeff"][target_idx].to(device).float(),
                     self.priors["jaccard_overlap"][target_idx].to(device).float(),
                     self.priors["total_neighbor_count"][target_idx].to(device).float(),
+                    mean_ppr,
+                    density,
                 ],
                 dim=0,
             )
@@ -122,7 +140,13 @@ class MultiplexPillarSampler:
         kr = role_deg[target_idx]
         kt = kf + kr
         participation = torch.where(kt > 0, 1.0 - ((kf / kt) ** 2 + (kr / kt) ** 2), torch.tensor(0.0, device=device))
-        return torch.stack([participation.float(), torch.tensor(0.0, device=device), kt.float()], dim=0)
+        return torch.stack([participation.float(), torch.tensor(0.0, device=device), kt.float(),
+                            torch.tensor(0.0, device=device), density], dim=0)
+
+    def _get_ppr_centroid(self, target_idx):
+        if self.priors is None or "ppr_protein_centroid" not in self.priors:
+            return None
+        return self.priors["ppr_protein_centroid"][target_idx].to(self.protein_x.device).float()
 
     def get_pillar_context(self, target_idx):
         device = self.protein_x.device
@@ -149,7 +173,8 @@ class MultiplexPillarSampler:
             "role_binds_ei": role_binds_ei,
             "role_binds_y": role_binds_y,
             "role_binds_w": role_binds_w,
-            "trust_vector": self._build_trust_vector(target_idx),
+            "trust_vector": self._build_trust_vector(target_idx, form_neighbors, role_neighbors),
+            "ppr_centroid": self._get_ppr_centroid(target_idx),
         }
 
     def add_revealed_edges(self, new_edges, new_labels, new_weights=None):

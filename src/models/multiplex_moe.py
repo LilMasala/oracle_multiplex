@@ -13,7 +13,7 @@ class MultiplexMoE(nn.Module):
         z_refined, v_prior, delta_mean, floor_stats = self.smoother(pillar_data, drug_features)
         target_drug_feats = drug_features[target_drug_indices]
 
-        trust_vector = pillar_data.get("trust_vector", torch.zeros(3, device=z_refined.device))
+        trust_vector = pillar_data.get("trust_vector", torch.zeros(5, device=z_refined.device))
         scores, gate_probs, expert_tensor = self.router(
             z_refined=z_refined,
             protein_raw_features=pillar_data["target_features"],

@@ -82,7 +82,7 @@ def main():
     drug_dim = data["drug"].x.size(1)
     num_experts, lr = 4, 5e-4
 
-    loader = MultiplexPillarSampler(data, binds_metric="binds_activity")
+    loader = MultiplexPillarSampler(data, binds_metric="binds_activity", priors_cache_path="data/multiplex_priors.pt")
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
     print(f"🧬 Stream built: {len(episodes)} protein episodes ready.")
 
@@ -95,6 +95,8 @@ def main():
 
     print("\n🎬 STARTING REAL PREQUENTIAL STREAM (PURE COLD-START)")
     print("-" * 80)
+
+    os.makedirs("models", exist_ok=True)
 
     episode_log = []
     loader.binds_ei = torch.empty((2, 0), dtype=torch.long, device=device)
@@ -151,7 +153,7 @@ def main():
 
             # Current episode loss (keeps episode-specific gate dynamics / ELBO path).
             sup_preds, s_gate_probs, s_experts, s_stats = model(pillar, data["drug"].x, mb_drugs)
-            curr_losses = loss_fn(sup_preds, mb_labels, s_gate_probs, s_experts)
+            curr_losses = loss_fn(sup_preds, mb_labels, s_gate_probs, s_experts, protein_level_gate=True)
             total = curr_losses["total_loss"] / n_batches
             current_losses.append(float(curr_losses["total_loss"].detach().item()))
             rank_losses.append(curr_losses["rank_loss"].item())
@@ -173,6 +175,10 @@ def main():
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+
+        if i % 50 == 0 and i > 0:
+            torch.save(model.state_dict(), f"models/checkpoint_ep{i:04d}.pt")
+
         rank_loss = float(np.mean(rank_losses)) if rank_losses else 0.0
         replay_loss = float(np.mean(replay_losses)) if replay_losses else 0.0
         current_loss = float(np.mean(current_losses)) if current_losses else 0.0

@@ -10,7 +10,7 @@ from torch.distributions import constraints
 class ExpertScorer(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim=256, dropout=0.2):
         super().__init__()
-        # z_p input shape: [N, protein_dim + 2 * drug_dim] where context=[v_prior, delta_mean]
+        # z_p input shape: [N, z_refined(protein_dim) + v_prior(drug_dim) + delta_mean(protein_dim)]
         self.p_proj = nn.Linear((2 * protein_dim) + drug_dim, hidden_dim)
         # z_d input shape: [N, drug_dim + 2 * drug_dim] after concatenating [drug_emb, v_prior, delta_mean]
         self.d_proj = nn.Linear((2 * drug_dim) + protein_dim, hidden_dim)
@@ -38,7 +38,7 @@ class MultiplexMoEGate(nn.Module):
     Input = [z_t, v_prior, delta_mean, trust_vector].
     """
 
-    def __init__(self, protein_dim, drug_dim, trust_dim, num_experts, hidden_dim=128, top_k=2):
+    def __init__(self, protein_dim, drug_dim, trust_dim=5, num_experts=4, hidden_dim=128, top_k=2):
         super().__init__()
         self.top_k = top_k
         self.router = nn.Sequential(
@@ -73,7 +73,7 @@ class MultiplexMoEGate(nn.Module):
 
 
 class MultiplexRoutingHead(nn.Module):
-    def __init__(self, protein_dim, drug_dim, num_experts=4, top_k=2, trust_dim=3):
+    def __init__(self, protein_dim, drug_dim, num_experts=4, top_k=2, trust_dim=5):
         super().__init__()
         self.gate = MultiplexMoEGate(
             protein_dim=protein_dim,
@@ -113,7 +113,7 @@ class BayesianMultiplexRouter(PyroModule):
         self,
         protein_dim,
         drug_dim,
-        trust_dim=3,
+        trust_dim=5,
         max_experts=16,
         hidden_dim=128,
         top_k=2,

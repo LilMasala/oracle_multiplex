@@ -4,7 +4,9 @@ from pyro.infer import TraceMeanField_ELBO
 
 def build_router_elbo(num_particles=1):
     """Create ELBO object used in unified differentiable optimization."""
-    pyro.clear_param_store()
+    # Caller is responsible for clearing the param store at initialization time if needed;
+    # doing so here would silently reset learned variational parameters (q_beta_a, q_beta_b,
+    # component_loc, component_scale) if called after training has started.
     return TraceMeanField_ELBO(num_particles=num_particles)
 
 
@@ -16,6 +18,7 @@ def train_stream_step_with_svi(
     z_refined,
     protein_raw_features,
     v_prior,
+    delta_mean,
     query_drug_features,
     trust_vector,
     labels,
@@ -35,6 +38,7 @@ def train_stream_step_with_svi(
         router.guide,
         protein_raw_features,
         v_prior,
+        delta_mean,
         trust_vector,
     )
     num_context = protein_raw_features.shape[0] if protein_raw_features.dim() > 1 else 1
@@ -44,6 +48,7 @@ def train_stream_step_with_svi(
         z_refined=z_refined,
         protein_raw_features=protein_raw_features,
         v_prior=v_prior,
+        delta_mean=delta_mean,
         query_drug_features=query_drug_features,
         trust_vector=trust_vector,
     )

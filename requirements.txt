@@ -1,0 +1,5 @@
+torch>=2.0.0
+torch-geometric
+pyro-ppl>=1.8.0
+numpy
+pandas

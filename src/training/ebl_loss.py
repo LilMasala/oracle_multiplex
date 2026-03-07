@@ -13,17 +13,20 @@ class EBLLoss(nn.Module):
         lambda_rank_weight=0.5,
         min_temperature=0.02,
         min_eps=0.02,
+        entropy_weight=0.01,
     ):
         super().__init__()
         self.ebl_alpha = ebl_alpha
-        self.base_temperature = temperature
-        self.base_eps = eps
-        self.temperature = temperature
-        self.eps = eps
         self.rank_weight = rank_weight
         self.lambda_rank_weight = lambda_rank_weight
         self.min_temperature = min_temperature
         self.min_eps = min_eps
+        self.entropy_weight = entropy_weight
+        # Register as buffers so annealed values are captured by state_dict().
+        self.register_buffer('temperature', torch.tensor(temperature))
+        self.register_buffer('eps', torch.tensor(eps))
+        self.register_buffer('base_temperature', torch.tensor(temperature))
+        self.register_buffer('base_eps', torch.tensor(eps))
 
     def step_schedule(self, step_idx, total_steps):
         progress = min(max(step_idx / max(total_steps, 1), 0.0), 1.0)
@@ -33,7 +36,7 @@ class EBLLoss(nn.Module):
     def _compute_listnet_loss(self, preds, labels):
         if len(preds) < 2:
             return torch.tensor(0.0, device=preds.device, requires_grad=True)
-        target_probs = F.softmax(labels / 0.5, dim=0)
+        target_probs = F.softmax(labels / self.temperature, dim=0)
         pred_probs = F.log_softmax(preds, dim=0)
         return -torch.sum(target_probs * pred_probs)
 
@@ -73,7 +76,11 @@ class EBLLoss(nn.Module):
             gate_loss = -torch.sum(target_gate_probs * torch.log(gate_probs + 1e-12), dim=-1).mean()
 
         expert_loss = torch.sum(mean_mse * target_gate_probs.detach(), dim=-1).mean()
-        total_loss = expert_loss + (self.ebl_alpha * gate_loss) + (self.rank_weight * ranking_loss)
+
+        routing_entropy = -(gate_probs * torch.log(gate_probs + 1e-8)).sum(-1).mean()
+        load_balance_loss = -self.entropy_weight * routing_entropy
+
+        total_loss = expert_loss + (self.ebl_alpha * gate_loss) + (self.rank_weight * ranking_loss) + load_balance_loss
 
         return {
             "total_loss": total_loss,
@@ -82,4 +89,5 @@ class EBLLoss(nn.Module):
             "rank_loss": ranking_loss.detach(),
             "listnet_loss": listnet_loss.detach(),
             "lambda_ci_loss": lambda_loss.detach(),
+            "load_balance_loss": load_balance_loss.detach(),
         }

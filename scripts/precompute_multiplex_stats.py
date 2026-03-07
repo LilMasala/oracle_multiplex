@@ -106,6 +106,24 @@ def _compute_topk_ppr(
     return topk_idx, topk_score
 
 
+def _compute_mean_ppr_score(ppr_scores: torch.Tensor) -> torch.Tensor:
+    valid = ppr_scores > 0
+    total = valid.sum(dim=1).clamp_min(1).float()
+    return (ppr_scores * valid.float()).sum(dim=1) / total  # [N]
+
+
+def _compute_ppr_centroid(ppr_idx, ppr_scores, protein_x, num_nodes, device):
+    protein_dim = protein_x.size(1)
+    centroid = torch.zeros(num_nodes, protein_dim, device=device)
+    for i in range(num_nodes):
+        valid = ppr_idx[i] >= 0
+        idx = ppr_idx[i][valid]
+        w = ppr_scores[i][valid]
+        if idx.numel() > 0:
+            centroid[i] = (w.unsqueeze(-1) * protein_x[idx]).sum(0) / w.sum().clamp_min(1e-8)
+    return centroid  # [N, protein_dim]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Precompute multiplex trust priors and diffusion cache.")
     parser.add_argument("--graph-path", type=str, default="data/final_graph_data_not_normalized.pt")
@@ -145,6 +163,10 @@ def main():
         device=device,
     )
 
+    protein_x = data["protein"].x.to(device)
+    mean_ppr_score = _compute_mean_ppr_score(ppr_scores)
+    ppr_centroid = _compute_ppr_centroid(ppr_idx, ppr_scores, protein_x, num_nodes, device)
+
     cache = {
         "num_nodes": num_nodes,
         "alpha": args.alpha,
@@ -154,6 +176,8 @@ def main():
         "total_neighbor_count": total_neighbors.cpu(),
         "ppr_topk_indices": ppr_idx.cpu(),
         "ppr_topk_scores": ppr_scores.cpu(),
+        "mean_ppr_score": mean_ppr_score.cpu(),
+        "ppr_protein_centroid": ppr_centroid.cpu(),
     }
     torch.save(cache, output_path)
     print(f"Saved multiplex priors to {output_path}")
