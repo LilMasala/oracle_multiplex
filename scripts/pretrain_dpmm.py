@@ -78,9 +78,9 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         if step % 200 == 0:
             print(f"  step {step:4d}  ELBO loss: {loss:.4f}")
 
-    centroids = pyro.param("bayesian_router$$$component_loc").detach().cpu()  # [K, static_obs_dim]
-    q_beta_a = pyro.param("bayesian_router$$$q_beta_a").detach().cpu()        # [K-1]
-    q_beta_b = pyro.param("bayesian_router$$$q_beta_b").detach().cpu()        # [K-1]
+    centroids = pyro.param("bayesian_router$$component_loc").detach().cpu()  # [K, static_obs_dim]
+    q_beta_a = pyro.param("bayesian_router$$q_beta_a").detach().cpu()        # [K-1]
+    q_beta_b = pyro.param("bayesian_router$$q_beta_b").detach().cpu()        # [K-1]
 
     with torch.no_grad():
         weights = router.expected_stick_weights().cpu()  # [K]
