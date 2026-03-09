@@ -91,7 +91,12 @@ def main():
 
     smoother = MultiplexInductiveSmoother(prot_dim, drug_dim).to(device)
     pyro.clear_param_store()
-    router = BayesianMultiplexRouter(prot_dim, drug_dim, max_experts=16).to(device)
+    dpmm_init = None
+    if os.path.exists("data/dpmm_init.pt"):
+        print("📍 Loading offline DPMM initialization from data/dpmm_init.pt...")
+        raw = torch.load("data/dpmm_init.pt", weights_only=False)
+        dpmm_init = {k: v.to(device) for k, v in raw.items()}
+    router = BayesianMultiplexRouter(prot_dim, drug_dim, max_experts=16, dpmm_init=dpmm_init).to(device)
     model = MultiplexMoE(smoother, router).to(device)
     elbo = build_router_elbo()
 
@@ -141,10 +146,14 @@ def main():
         # gradient graph as the supervised mini-batch losses below.
         z_ep, v_ep, delta_ep, _ = model.smoother(pillar, data["drug"].x)
         trust_ep = pillar.get("trust_vector", torch.zeros(5, device=device)).float()
+        ppr_centroid_ep = pillar.get("ppr_centroid", torch.zeros(prot_dim, device=device))
+        static_trust_4_ep = trust_ep[:4].unsqueeze(0)  # [1, 4]
         elbo_loss = elbo.differentiable_loss(
             model.router.model,
             model.router.guide,
             pillar["target_features"],
+            ppr_centroid_ep,
+            static_trust_4_ep,
             v_ep,
             delta_ep,
             trust_ep,

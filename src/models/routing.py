@@ -105,8 +105,11 @@ class BayesianMultiplexRouter(PyroModule):
     """
     Truncated stick-breaking DPMM router with deterministic experts.
 
-    - Generative model observes concatenated context [z_t, v_prior, delta_mean, trust_vector].
+    - DPMM generative model observes static protein features: [z_t, ppr_centroid, static_trust_4].
+      This space is drug-data-independent, enabling offline pre-initialization.
+    - Router gate still uses full context [z_t, v_prior, delta_mean, trust_vector] for quality.
     - Routing is computed once at protein-level; broadcast only for expert score aggregation.
+    - DP concentration alpha is inferred via a Gamma variational posterior (conjugate to Beta).
     """
 
     def __init__(
@@ -117,8 +120,10 @@ class BayesianMultiplexRouter(PyroModule):
         max_experts=16,
         hidden_dim=128,
         top_k=2,
-        dp_concentration=1.0,
         obs_scale=1.0,
+        alpha_prior_shape=1.0,
+        alpha_prior_rate=1.0,
+        dpmm_init=None,
     ):
         super().__init__()
         self.protein_dim = protein_dim
@@ -126,8 +131,13 @@ class BayesianMultiplexRouter(PyroModule):
         self.trust_dim = trust_dim
         self.max_experts = max_experts
         self.top_k = top_k
-        self.dp_concentration = dp_concentration
+        self.alpha_prior_shape = alpha_prior_shape
+        self.alpha_prior_rate = alpha_prior_rate
 
+        # Static observation space: [z_t, ppr_centroid, static_trust_4] = 2*protein_dim + 4
+        self.static_obs_dim = 2 * protein_dim + 4
+
+        # Full router input for gate net: [z_t, v_prior, delta_mean, trust_vector]
         self.router_input_dim = (2 * protein_dim) + drug_dim + trust_dim
         self.router_net = PyroModule[nn.Sequential](
             nn.Linear(self.router_input_dim, hidden_dim),
@@ -139,16 +149,45 @@ class BayesianMultiplexRouter(PyroModule):
             ExpertScorer(protein_dim, drug_dim) for _ in range(max_experts)
         ])
 
-        # Generative emission parameters for concatenated observations.
-        self.component_loc = PyroParam(torch.zeros(max_experts, self.router_input_dim))
+        # DPMM emission parameters on static observation space.
+        if dpmm_init is not None and "centroids" in dpmm_init:
+            init_loc = dpmm_init["centroids"].float()
+        else:
+            init_loc = torch.zeros(max_experts, self.static_obs_dim)
+        self.component_loc = PyroParam(init_loc)
         self.component_scale = PyroParam(
-            torch.full((max_experts, self.router_input_dim), obs_scale),
+            torch.full((max_experts, self.static_obs_dim), obs_scale),
             constraint=constraints.positive,
         )
 
-        # Variational parameters for q(beta).
-        self.q_beta_a = PyroParam(torch.ones(max_experts - 1), constraint=constraints.positive)
-        self.q_beta_b = PyroParam(torch.ones(max_experts - 1), constraint=constraints.positive)
+        # Variational parameters for q(beta) — init from offline fit if available.
+        if dpmm_init is not None and "q_beta_a" in dpmm_init and "q_beta_b" in dpmm_init:
+            q_a = dpmm_init["q_beta_a"].float().clamp(min=1e-3)
+            q_b = dpmm_init["q_beta_b"].float().clamp(min=1e-3)
+        elif dpmm_init is not None and "weights" in dpmm_init:
+            # Derive Beta params from stick weights: E[beta_k] ≈ w_k / remaining_mass
+            weights = dpmm_init["weights"].float()
+            K = max_experts - 1
+            remaining = torch.ones(K)
+            q_a = torch.ones(K)
+            q_b = torch.ones(K)
+            for k in range(K):
+                if remaining[k] > 1e-8:
+                    beta_mean = (weights[k] / remaining[k]).clamp(1e-4, 1 - 1e-4)
+                    # Beta(a, b) with mean a/(a+b) = beta_mean, concentration 10
+                    conc = 10.0
+                    q_a[k] = beta_mean * conc
+                    q_b[k] = (1.0 - beta_mean) * conc
+                remaining[k + 1] = remaining[k] - weights[k].item() if k + 1 < K else remaining[k]
+        else:
+            q_a = torch.ones(max_experts - 1)
+            q_b = torch.ones(max_experts - 1)
+        self.q_beta_a = PyroParam(q_a, constraint=constraints.positive)
+        self.q_beta_b = PyroParam(q_b, constraint=constraints.positive)
+
+        # Variational parameters for q(alpha) — Gamma posterior on DP concentration.
+        self.q_alpha_shape = PyroParam(torch.tensor(alpha_prior_shape), constraint=constraints.positive)
+        self.q_alpha_rate = PyroParam(torch.tensor(alpha_prior_rate), constraint=constraints.positive)
 
     def _stick_breaking(self, beta_samples):
         prefix = torch.cumprod(1.0 - beta_samples + 1e-8, dim=-1)
@@ -166,6 +205,16 @@ class BayesianMultiplexRouter(PyroModule):
             logits = sparse_logits
         return F.softmax(logits, dim=-1)
 
+    def _static_obs(self, z_t, ppr_centroid, static_trust_4):
+        """Build static observation: [z_t, ppr_centroid, static_trust_4] = [B, 2*protein_dim + 4]."""
+        if z_t.dim() == 1:
+            z_t = z_t.unsqueeze(0)
+        if ppr_centroid.dim() == 1:
+            ppr_centroid = ppr_centroid.unsqueeze(0)
+        if static_trust_4.dim() == 1:
+            static_trust_4 = static_trust_4.unsqueeze(0)
+        return torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1)
+
     def _router_input(self, z_t, v_prior, delta_mean, trust_vector):
         if z_t.dim() == 1:
             z_t = z_t.unsqueeze(0)
@@ -178,16 +227,25 @@ class BayesianMultiplexRouter(PyroModule):
         # router input: [B, 2*protein_dim + drug_dim + trust_dim]
         return torch.cat([z_t, v_prior, delta_mean, trust_vector], dim=-1)
 
-    def model(self, z_t, v_prior, delta_mean, trust_vector):
+    def model(self, z_t, ppr_centroid, static_trust_4, v_prior, delta_mean, trust_vector):
         pyro.module("bayesian_router", self)
-        obs_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)
+        obs_x = self._static_obs(z_t, ppr_centroid, static_trust_4)
+        device = obs_x.device
 
-        alpha = obs_x.new_tensor(self.dp_concentration)
+        # DP concentration has a Gamma prior (conjugate to stick-breaking Beta).
+        dp_alpha = pyro.sample(
+            "dp_alpha",
+            dist.Gamma(
+                torch.tensor(self.alpha_prior_shape, device=device),
+                torch.tensor(self.alpha_prior_rate, device=device),
+            ),
+        )
+
         beta = pyro.sample(
             "beta",
             dist.Beta(
-                torch.ones(self.max_experts - 1, device=obs_x.device),
-                alpha.expand(self.max_experts - 1),
+                torch.ones(self.max_experts - 1, device=device),
+                dp_alpha * torch.ones(self.max_experts - 1, device=device),
             ).to_event(1),
         )
         stick_weights = self._stick_breaking(beta)
@@ -200,13 +258,18 @@ class BayesianMultiplexRouter(PyroModule):
                 obs=obs_x,
             )
 
-    def guide(self, z_t, v_prior, delta_mean, trust_vector):
-        obs_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)
+    def guide(self, z_t, ppr_centroid, static_trust_4, v_prior, delta_mean, trust_vector):
+        obs_x = self._static_obs(z_t, ppr_centroid, static_trust_4)
+        full_x = self._router_input(z_t, v_prior, delta_mean, trust_vector)
+
+        # Variational Gamma for DP concentration alpha.
+        pyro.sample("dp_alpha", dist.Gamma(self.q_alpha_shape, self.q_alpha_rate))
 
         beta = pyro.sample("beta", dist.Beta(self.q_beta_a, self.q_beta_b).to_event(1))
         stick_weights = self._stick_breaking(beta)
 
-        logits = self.router_net(obs_x)
+        # Gate uses full context for quality; DPMM cluster assignment uses static obs.
+        logits = self.router_net(full_x)
         q_z = self._masked_softmax(logits)
         q_z = q_z * stick_weights.unsqueeze(0)
         q_z = q_z / (q_z.sum(dim=-1, keepdim=True) + 1e-8)

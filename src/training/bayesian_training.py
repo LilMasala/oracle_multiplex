@@ -24,6 +24,8 @@ def train_stream_step_with_svi(
     ebl_loss_fn,
     z_refined,
     protein_raw_features,
+    ppr_centroid,
+    static_trust_4,
     v_prior,
     delta_mean,
     query_drug_features,
@@ -37,6 +39,10 @@ def train_stream_step_with_svi(
 
     The ELBO is normalized by the number of protein-level contexts in the step
     so its scale does not grow with drug query batch size.
+
+    Args:
+        ppr_centroid: PPR-weighted protein centroid [B, protein_dim] (static obs space).
+        static_trust_4: First 4 trust features [B, 4], drug-data-independent (static obs space).
     """
     optimizer.zero_grad(set_to_none=True)
 
@@ -44,6 +50,8 @@ def train_stream_step_with_svi(
         router.model,
         router.guide,
         protein_raw_features,
+        ppr_centroid,
+        static_trust_4,
         v_prior,
         delta_mean,
         trust_vector,
