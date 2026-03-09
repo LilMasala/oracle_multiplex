@@ -47,8 +47,21 @@ def build_static_obs(data, loader, device):
     return z_t, ppr_centroid, static_trust_4
 
 
-def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=2000, lr=1e-3, device="cpu"):
+def compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim):
+    """Fit PCA on raw static obs [N, 2*protein_dim+4] → keep top pca_dim components."""
+    raw = torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1).float()  # [N, D]
+    mean = raw.mean(dim=0)
+    centered = raw - mean
+    _, _, V = torch.pca_lowrank(centered, q=pca_dim, niter=4)  # V: [D, pca_dim]
+    components = V.T.contiguous()  # [pca_dim, D]
+    return mean.cpu(), components.cpu()
+
+
+def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=2000, lr=1e-3, device="cpu", pca_dim=256):
     protein_dim = z_t.size(1)
+
+    print(f"  Computing PCA: {2 * protein_dim + 4}D → {pca_dim}D ...")
+    pca_mean, pca_components = compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim)
 
     pyro.clear_param_store()
     # drug_dim=1 is a placeholder; it's only used by router_net / forward(), not model/guide obs.
@@ -56,6 +69,7 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         protein_dim=protein_dim,
         drug_dim=1,
         max_experts=max_experts,
+        dpmm_init={"pca_mean": pca_mean, "pca_components": pca_components},
     ).to(device)
 
     svi = SVI(
@@ -78,9 +92,9 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         if step % 200 == 0:
             print(f"  step {step:4d}  ELBO loss: {loss:.4f}")
 
-    centroids = pyro.param("bayesian_router$$component_loc").detach().cpu()  # [K, static_obs_dim]
-    q_beta_a = pyro.param("bayesian_router$$q_beta_a").detach().cpu()        # [K-1]
-    q_beta_b = pyro.param("bayesian_router$$q_beta_b").detach().cpu()        # [K-1]
+    centroids = router.component_loc.detach().cpu()  # [K, static_obs_dim]
+    q_beta_a = router.q_beta_a.detach().cpu()        # [K-1]
+    q_beta_b = router.q_beta_b.detach().cpu()        # [K-1]
 
     with torch.no_grad():
         weights = router.expected_stick_weights().cpu()  # [K]
@@ -89,7 +103,11 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
     static_obs = router._static_obs(z_t, ppr_centroid, static_trust_4)  # [N, static_obs_dim]
     with torch.no_grad():
         log_probs = dist_log_prob(static_obs, centroids.to(device), router.component_scale.detach())
-        assignments = log_probs.argmax(dim=-1).cpu()  # [N]
+
+        log_weights = torch.log(weights.to(device) + 1e-12)
+
+        log_post = log_probs + log_weights
+        assignments = log_post.argmax(dim=-1)
 
     return {
         "centroids": centroids,
@@ -97,6 +115,8 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         "q_beta_a": q_beta_a,
         "q_beta_b": q_beta_b,
         "assignments": assignments,
+        "pca_mean": pca_mean,
+        "pca_components": pca_components,
     }
 
 
@@ -117,6 +137,7 @@ def main():
     parser.add_argument("--max-experts", type=int, default=16)
     parser.add_argument("--n-steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--pca-dim", type=int, default=256, help="PCA dimensionality for static obs before DPMM")
     parser.add_argument("--output", default="data/dpmm_init.pt")
     args = parser.parse_args()
 
@@ -151,13 +172,14 @@ def main():
     z_t, ppr_centroid, static_trust_4 = build_static_obs(data, loader, device)
     print(f"  z_t: {z_t.shape}  ppr_centroid: {ppr_centroid.shape}  static_trust_4: {static_trust_4.shape}")
 
-    print(f"\nRunning offline DPMM SVI ({args.n_steps} steps, max_experts={args.max_experts})...")
+    print(f"\nRunning offline DPMM SVI ({args.n_steps} steps, max_experts={args.max_experts}, pca_dim={args.pca_dim})...")
     result = pretrain_dpmm(
         z_t, ppr_centroid, static_trust_4,
         max_experts=args.max_experts,
         n_steps=args.n_steps,
         lr=args.lr,
         device=str(device),
+        pca_dim=args.pca_dim,
     )
 
     print(f"\nFitted cluster weights (top-5): {result['weights'].topk(5).values.tolist()}")
@@ -166,10 +188,12 @@ def main():
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
     torch.save({k: v.cpu() for k, v in result.items()}, args.output)
     print(f"\nSaved DPMM init to {args.output}")
-    print(f"  centroids: {result['centroids'].shape}")
-    print(f"  weights:   {result['weights'].shape}")
-    print(f"  q_beta_a:  {result['q_beta_a'].shape}")
-    print(f"  q_beta_b:  {result['q_beta_b'].shape}")
+    print(f"  centroids:      {result['centroids'].shape}")
+    print(f"  weights:        {result['weights'].shape}")
+    print(f"  q_beta_a:       {result['q_beta_a'].shape}")
+    print(f"  q_beta_b:       {result['q_beta_b'].shape}")
+    print(f"  pca_mean:       {result['pca_mean'].shape}")
+    print(f"  pca_components: {result['pca_components'].shape}")
 
 
 if __name__ == "__main__":

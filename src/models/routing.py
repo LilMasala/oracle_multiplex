@@ -134,8 +134,17 @@ class BayesianMultiplexRouter(PyroModule):
         self.alpha_prior_shape = alpha_prior_shape
         self.alpha_prior_rate = alpha_prior_rate
 
-        # Static observation space: [z_t, ppr_centroid, static_trust_4] = 2*protein_dim + 4
-        self.static_obs_dim = 2 * protein_dim + 4
+        # PCA projection (optional, loaded from offline pretrain checkpoint).
+        # Registered as buffers so they move with .to(device) and are saved in state_dict.
+        if dpmm_init is not None and "pca_components" in dpmm_init:
+            self.register_buffer("pca_mean", dpmm_init["pca_mean"].float())
+            self.register_buffer("pca_components", dpmm_init["pca_components"].float())  # [pca_dim, raw_dim]
+            self.static_obs_dim = dpmm_init["pca_components"].size(0)
+        else:
+            self.register_buffer("pca_mean", None)
+            self.register_buffer("pca_components", None)
+            # Static observation space: [z_t, ppr_centroid, static_trust_4] = 2*protein_dim + 4
+            self.static_obs_dim = 2 * protein_dim + 4
 
         # Full router input for gate net: [z_t, v_prior, delta_mean, trust_vector]
         self.router_input_dim = (2 * protein_dim) + drug_dim + trust_dim
@@ -206,14 +215,17 @@ class BayesianMultiplexRouter(PyroModule):
         return F.softmax(logits, dim=-1)
 
     def _static_obs(self, z_t, ppr_centroid, static_trust_4):
-        """Build static observation: [z_t, ppr_centroid, static_trust_4] = [B, 2*protein_dim + 4]."""
+        """Build static observation, optionally projected via PCA."""
         if z_t.dim() == 1:
             z_t = z_t.unsqueeze(0)
         if ppr_centroid.dim() == 1:
             ppr_centroid = ppr_centroid.unsqueeze(0)
         if static_trust_4.dim() == 1:
             static_trust_4 = static_trust_4.unsqueeze(0)
-        return torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1)
+        raw = torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1)  # [B, 2*protein_dim + 4]
+        if self.pca_components is not None:
+            raw = (raw - self.pca_mean) @ self.pca_components.T       # [B, pca_dim]
+        return raw
 
     def _router_input(self, z_t, v_prior, delta_mean, trust_vector):
         if z_t.dim() == 1:
