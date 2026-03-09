@@ -104,10 +104,11 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
     with torch.no_grad():
         log_probs = dist_log_prob(static_obs, centroids.to(device), router.component_scale.detach())
 
-        log_weights = torch.log(weights.to(device) + 1e-12)
+        # log_weights = torch.log(weights.to(device) + 1e-12)
 
-        log_post = log_probs + log_weights
-        assignments = log_post.argmax(dim=-1)
+        # log_post = log_probs + log_weights
+        # assignments = log_post.argmax(dim=-1)
+        assignments = log_probs.argmax(dim=-1)
 
     return {
         "centroids": centroids,
