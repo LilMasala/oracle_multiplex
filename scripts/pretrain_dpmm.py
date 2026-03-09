@@ -18,9 +18,10 @@ import argparse
 import os
 import torch
 import torch.distributions as td
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import pyro
 from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import ClippedAdam
+from pyro.optim import PyroLRScheduler
 
 from src.models.routing import BayesianMultiplexRouter
 from src.data.multiplex_loader import MultiplexPillarSampler
@@ -57,8 +58,9 @@ def compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim):
     return mean.cpu(), components.cpu()
 
 
-def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=2000, lr=1e-3, device="cpu", pca_dim=256):
+def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=2000, lr=1e-3, device="cpu", pca_dim=256, warmup_steps=None):
     protein_dim = z_t.size(1)
+    warmup_steps = warmup_steps if warmup_steps is not None else max(1, n_steps // 10)
 
     print(f"  Computing PCA: {2 * protein_dim + 4}D → {pca_dim}D ...")
     pca_mean, pca_components = compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim)
@@ -72,12 +74,17 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         dpmm_init={"pca_mean": pca_mean, "pca_components": pca_components},
     ).to(device)
 
-    svi = SVI(
-        router.model,
-        router.guide,
-        ClippedAdam({"lr": lr, "clip_norm": 5.0}),
-        loss=Trace_ELBO(num_particles=4),
+    def make_scheduler(optim):
+        warmup = LinearLR(optim, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(optim, T_max=max(1, n_steps - warmup_steps), eta_min=lr * 0.01)
+        return SequentialLR(optim, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+    scheduler = PyroLRScheduler(
+        make_scheduler,
+        {"optimizer": torch.optim.Adam, "optim_args": {"lr": lr}},
+        clip_args={"clip_norm": 5.0},
     )
+    svi = SVI(router.model, router.guide, scheduler, loss=Trace_ELBO(num_particles=4))
 
     # Dummy full-context tensors for router_net in guide.
     # Must match batch dim N since _router_input uses torch.cat (no broadcast).
@@ -87,10 +94,13 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
     trust_dummy = torch.zeros(N, 5, device=device)
 
     print(f"  static_obs_dim = {router.static_obs_dim}  |  N = {z_t.size(0)}")
+    print(f"  lr={lr}  warmup={warmup_steps} steps  cosine → {lr * 0.01:.2e}")
     for step in range(n_steps):
         loss = svi.step(z_t, ppr_centroid, static_trust_4, v_dummy, delta_dummy, trust_dummy)
+        scheduler.step()
         if step % 200 == 0:
-            print(f"  step {step:4d}  ELBO loss: {loss:.4f}")
+            current_lr = next(iter(scheduler.optim_objs.values())).optimizer.param_groups[0]["lr"]
+            print(f"  step {step:4d}  ELBO loss: {loss:.4f}  lr: {current_lr:.2e}")
 
     centroids = router.component_loc.detach().cpu()  # [K, static_obs_dim]
     q_beta_a = router.q_beta_a.detach().cpu()        # [K-1]
@@ -139,6 +149,7 @@ def main():
     parser.add_argument("--n-steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--pca-dim", type=int, default=256, help="PCA dimensionality for static obs before DPMM")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps (default: n_steps // 10)")
     parser.add_argument("--output", default="data/dpmm_init.pt")
     args = parser.parse_args()
 
@@ -181,6 +192,7 @@ def main():
         lr=args.lr,
         device=str(device),
         pca_dim=args.pca_dim,
+        warmup_steps=args.warmup_steps,
     )
 
     print(f"\nFitted cluster weights (top-5): {result['weights'].topk(5).values.tolist()}")
