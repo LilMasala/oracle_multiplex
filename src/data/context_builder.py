@@ -60,15 +60,15 @@ class TNPContextBuilder:
         Extract (protein, drug, affinity, ppr, trust, drug_idx, gnn_emb) tuples
         from one multiplex layer.
 
-        Returns 7 lists: prot_list, drug_list, aff_list, ppr_list,
-                          trust_list, didx_list, gnn_list
+        Returns 8 lists: prot_list, drug_list, aff_list, ppr_list,
+                          trust_list, didx_list, gnn_list, go_fp_list
         """
         if binds_ei.size(1) == 0 or neighbor_indices.numel() == 0:
-            return [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], []
 
         keep = binds_w >= self.min_affinity_weight
         if not keep.any():
-            return [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], []
 
         ei = binds_ei[:, keep]
         y  = binds_y[keep]
@@ -78,7 +78,7 @@ class TNPContextBuilder:
 
         valid = drug_idx < self.drug_features.size(0)
         if not valid.any():
-            return [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], []
         ei, y, w = ei[:, valid], y[valid], w[valid]
         drug_idx, prot_idx = drug_idx[valid], prot_idx[valid]
 
