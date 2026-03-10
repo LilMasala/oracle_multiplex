@@ -17,14 +17,14 @@ The core challenge in virtual screening is the **cold-start problem**: new or un
 MultiplexPillarSampler          # Fetches structural/functional neighbors, PPR scores, trust weights
         │
         ▼
-TNPContextBuilder               # Assembles context set: (protein, drug, affinity, ppr, delta, trust)
-        │
+TNPContextBuilder               # Assembles context set: (protein, drug, affinity, ppr, trust)
+        │                       # Units 2/5/6: synthetic prior, drug analog injection, GNN embeddings
         ▼
 ProteinLigandTNP                # Graph-biased Transformer Neural Process
-  ├── Context encoder           # (protein, drug, affinity) → token
-  ├── Query encoder             # (protein, drug) → token
-  ├── GraphBiasedTransformer    # PPR + delta logit biases; trust V-gate
-  └── Output head               # token → (mu, sigma)
+  ├── Context encoder           # (protein, drug, affinity) → token  [+ GNN residual]
+  ├── Query encoder             # (protein, drug) → token             [+ PPR centroid blend, GNN residual]
+  ├── GraphBiasedTransformer    # PPR logit biases; trust V-gate; density signal
+  └── Output head               # token → (mu + ctx_affinity_mean, sigma)
         │
         ▼
 TNPLoss                         # Gaussian NLL + ListNet + Lambda-MART ranking losses
@@ -35,11 +35,14 @@ TNPLoss                         # Gaussian NLL + ListNet + Lambda-MART ranking l
 | Module | File | Description |
 |---|---|---|
 | `MultiplexPillarSampler` | `src/data/multiplex_loader.py` | Builds per-protein context: neighbors, PPR scores, trust vectors, temporal decay weights |
-| `TNPContextBuilder` | `src/data/context_builder.py` | Converts pillar dicts to TNP context tensors including ppr, delta, trust per edge |
-| `ProteinLigandTNP` | `src/models/tnp.py` | Graph-biased TNP with learnable PPR/delta/trust attention parameters |
-| `GraphBiasedMHA` | `src/models/tnp.py` | Multi-head attention with additive logit biases and multiplicative V gate |
-| `TNPLoss` | `src/training/tnp_loss.py` | NLL + ListNet + Lambda-MART composite ranking loss |
+| `TNPContextBuilder` | `src/data/context_builder.py` | Converts pillar dicts to TNP context tensors; synthetic prior (Unit 2), drug analog injection (Unit 5), GNN embedding collection (Unit 6) |
+| `ProteinLigandTNP` | `src/models/tnp.py` | Graph-biased TNP with context density gating (Unit 3), PPR centroid interpolation (Unit 4), GNN residual (Unit 6), context affinity anchoring |
+| `GraphBiasedMHA` | `src/models/tnp.py` | Multi-head attention with additive PPR logit biases and multiplicative trust V-gate |
+| `TNPLoss` | `src/training/tnp_loss.py` | NLL + ListNet + Lambda-MART composite ranking loss with homoscedastic uncertainty weighting |
 | `build_multiplex_stream` | `src/protocol/prequential.py` | Constructs sequential protein episodes for streaming evaluation |
+| `DrugAnalogIndex` | `src/data/drug_analog_index.py` | Precomputed top-K cosine-similar drug index for analog context injection |
+| `ProteinGNN` | `src/models/protein_gnn.py` | 2-layer GAT on form + role layers; residual neighborhood embeddings for cold-start |
+| `cold_start_metrics` | `src/training/cold_start_metrics.py` | Regime classification (cold/sparse/warm) and per-regime CI/EF10 summaries |
 | `BayesianMultiplexRouter` | `src/models/routing.py` | (Legacy v1) Stick-breaking DPMM with variational Beta/Gamma posteriors |
 
 ## Installation
@@ -94,11 +97,15 @@ Key arguments:
 
 | Argument | Default | Description |
 |---|---|---|
-| `--lr` | `5e-4` | Adam learning rate |
+| `--lr` | `1e-4` | Adam learning rate |
 | `--token-dim` | `256` | Transformer token dimensionality |
 | `--max-context` | `256` | Max neighbor binding tuples in context set |
-| `--replay-weight` | `0.25` | Experience replay loss scaling |
+| `--replay-weight` | `0.5` | Experience replay loss scaling |
 | `--n-episodes` | all | Limit episodes for quick testing |
+| `--enable-synthetic-prior` | off | Inject synthetic prior token at cold-start (Unit 2) |
+| `--drug-analogs` | off | Enable drug analog context injection (Unit 5) |
+| `--use-gnn` | off | Enable 2-layer GAT protein pre-encoder (Unit 6) |
+| `--cold-start-only` | off | Evaluation-only mode; skip training |
 
 ### 2. (Optional) Pre-initialize the DPMM (Legacy v1)
 
@@ -139,27 +146,44 @@ The explicit `sigma` output allows the model to express uncertainty — useful f
 
 ### Graph-Biased Attention
 
-Rather than treating all neighbor-binding tuples as equally informative, three graph signals are injected into the attention mechanism:
+Rather than treating all neighbor-binding tuples as equally informative, two graph signals are injected into the attention mechanism:
 
 **1. PPR logit bias** — Personalized PageRank score (diffusion proximity) of the context neighbor to the target protein:
 ```
 attn_logit(i → ctx_k) += α · log(ppr_k + ε)
 ```
-High-PPR neighbors receive higher attention, so the model naturally up-weights close relatives in the protein graph.
+High-PPR neighbors receive higher attention, up-weighting structurally close relatives in the protein graph.
 
-**2. Structural delta bias** — Projected difference between target and neighbor protein embeddings:
-```
-attn_logit(i → ctx_k) += w_delta · (target_emb - neighbor_emb_k)
-```
-This encourages attention to neighbors that are structurally close (small delta → small bias correction), and lets the model learn which structural dimensions matter for binding transfer.
-
-**3. Temporal trust gate** — Multiplicative gate on context token values using edge recency:
+**2. Temporal trust gate** — Multiplicative gate on context token values using edge recency/confidence:
 ```
 v_ctx_k ← sigmoid(s · decay_weight_k) · v_ctx_k
 ```
-Old, low-confidence binding edges are downweighted in the value aggregation; fresh or high-confidence edges pass through at full strength.
+Old or low-confidence binding edges are downweighted in value aggregation; fresh or high-confidence edges pass through at full strength.
 
-All three parameters (`α`, `w_delta`, `s`) are learnable and initialized at zero, so the model starts as a standard TNP and gradually learns to exploit graph structure.
+Both parameters (`α`, `s`) are learnable and initialized near zero so the model starts as a standard TNP and gradually learns to exploit graph structure.
+
+### Cold-Start Improvements
+
+Six techniques to improve performance when no binding data is available:
+
+| Unit | Technique | Description |
+|---|---|---|
+| 1 | Regime tracking | Classifies each episode as cold (n_ctx=0), sparse (<8), or warm (≥8); writes `results/cold_start_summary.csv` |
+| 2 | Synthetic prior | At cold-start, injects a synthetic context token `(ppr_centroid, global_drug_mean, global_mean_affinity)` to activate the cross-attention path |
+| 3 | Density gating | `density = tanh(n_ctx/32)` projected into query tokens; learnable `cold_start_bias` inflates σ when context is sparse for calibrated uncertainty |
+| 4 | PPR centroid blend | Query protein blended toward the PPR-weighted neighborhood centroid: `p_eff = (1−α)·target + α·centroid`, with α decaying as context grows |
+| 5 | Drug analog injection | Chemically similar drugs (top-K cosine similarity) with known neighbor bindings are injected as pseudo-context tokens, weighted by drug similarity × PPR score |
+| 6 | Protein GNN | 2-layer GAT on form and role layers separately, fused via MLP; residual embeddings added to protein projections in both encoders |
+
+### Context Affinity Anchoring
+
+The model's output head predicts a **residual** around the observed neighborhood mean rather than the absolute affinity value:
+
+```
+mu = output_head(qry_token) + mean(ctx_affinity)
+```
+
+This prevents the common-mode gradient collapse that occurs when initial predictions (near 0) are far from the true affinity scale (pIC50 ≈ 5–9). The transformer only needs to learn *relative* drug rankings within the neighborhood — a much tighter target. At cold-start (no context), the global dataset mean is used as the anchor.
 
 ### Prequential Protocol
 
@@ -183,10 +207,12 @@ oracle_multiplex/
 ├── src/
 │   ├── data/
 │   │   ├── multiplex_loader.py    # MultiplexPillarSampler
-│   │   ├── context_builder.py     # TNPContextBuilder
+│   │   ├── context_builder.py     # TNPContextBuilder (+ Units 2, 5, 6)
+│   │   ├── drug_analog_index.py   # DrugAnalogIndex (Unit 5)
 │   │   └── make_graph.py
 │   ├── models/
-│   │   ├── tnp.py                 # ProteinLigandTNP (graph-biased)
+│   │   ├── tnp.py                 # ProteinLigandTNP (+ Units 3, 4, 6; affinity anchoring)
+│   │   ├── protein_gnn.py         # ProteinGNN — 2-layer GAT pre-encoder (Unit 6)
 │   │   ├── multiplex_moe.py       # (Legacy v1) MultiplexMoE orchestrator
 │   │   ├── routing.py             # BayesianMultiplexRouter + ExpertScorer
 │   │   └── smoothing.py           # MultiplexInductiveSmoother
@@ -194,6 +220,7 @@ oracle_multiplex/
 │   │   └── prequential.py         # build_multiplex_stream
 │   └── training/
 │       ├── tnp_loss.py            # TNPLoss (NLL + ListNet + Lambda-MART)
+│       ├── cold_start_metrics.py  # Regime tracking + summary (Unit 1)
 │       ├── ebl_loss.py            # (Legacy v1) EBLLoss
 │       ├── bayesian_training.py   # ELBO construction
 │       ├── metrics.py             # CI, EF@k
@@ -202,6 +229,7 @@ oracle_multiplex/
 │   ├── pretrain_dpmm.py           # Offline DPMM pre-initialization
 │   ├── precompute_multiplex_stats.py
 │   └── build_base_graph.py
+├── diagnostic_attention.py        # Attention flow + gradient diagnostic tool
 ├── run_streaming_exp_tnp.py       # Main entry point (TNP)
 ├── run_streaming_exp.py           # (Legacy v1) MoE entry point
 ├── run_streaming_exp.ipynb

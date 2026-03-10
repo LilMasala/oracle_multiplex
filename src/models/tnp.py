@@ -222,6 +222,7 @@ class ProteinLigandTNP(nn.Module):
         ppr_centroid: Optional[torch.Tensor] = None,  # Unit 4: [protein_dim]
         ctx_gnn_emb: Optional[torch.Tensor] = None,   # Unit 6: [N_ctx, gnn_dim]
         qry_gnn_emb: Optional[torch.Tensor] = None,   # Unit 6: [N_qry, gnn_dim]
+        global_mean_affinity: float = 6.5,            # fallback for cold-start
     ):
         device = qry_protein.device
         n_ctx  = ctx_protein.size(0)
@@ -274,6 +275,16 @@ class ProteinLigandTNP(nn.Module):
         pred    = self.output_head(qry_out)            # [N_qry, 2]
         mu        = pred[:, 0]
         log_sigma = pred[:, 1]
+
+        # Context affinity anchoring: shift mu by the observed neighborhood mean.
+        # The transformer only needs to learn residuals around that mean, which is
+        # a much tighter target than predicting absolute affinity from scratch.
+        # At cold-start (n_ctx == 0) we fall back to the global mean affinity.
+        if n_ctx > 0:
+            ctx_mean = ctx_affinity.mean()
+        else:
+            ctx_mean = torch.tensor(global_mean_affinity, dtype=torch.float32, device=device)
+        mu = mu + ctx_mean
 
         # Unit 3: cold-start sigma bias — upward uncertainty when n_ctx is small
         # Bias decays to zero as density → 1 (warm regime)

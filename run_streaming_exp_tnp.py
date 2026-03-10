@@ -69,12 +69,14 @@ def sample_replay_batch(
     return replay_batches
 
 
-def run_episode(model, builder, drug_features, pillar, query_drug_indices, gnn_all_embs=None):
+def run_episode(model, builder, drug_features, pillar, query_drug_indices,
+                gnn_all_embs=None, global_mean_affinity=6.5):
     """
     Forward pass for one protein episode. Returns (mu, sigma).
 
     Args:
         gnn_all_embs: [N_proteins, gnn_dim] precomputed GNN embeddings or None (Unit 6)
+        global_mean_affinity: fallback anchor for cold-start (n_ctx == 0)
     """
     # Build context (6-tuple; last element is ctx_gnn_emb or None)
     ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn = builder.build_context(
@@ -101,6 +103,7 @@ def run_episode(model, builder, drug_features, pillar, query_drug_indices, gnn_a
         ppr_centroid=ppr_centroid,
         ctx_gnn_emb=ctx_gnn,
         qry_gnn_emb=qry_gnn_emb,
+        global_mean_affinity=global_mean_affinity,
     )
 
 
@@ -209,13 +212,6 @@ def main():
         gnn_emb_dim=gnn_emb_dim,
     ).to(device)
 
-    # Fix Bug 1: output head mu-bias initialized to 0 → model predicts ~0 while
-    # all affinities are pIC50 5–9.  The initial absolute error (~7.5) is 1000×
-    # larger than any drug-specific signal, so the first gradient step collapses
-    # all mu predictions to the same value and they never diverge again (CI = 0.5).
-    # Seeding the bias at the global mean affinity reduces the initial error to ~1
-    # and lets drug-specific gradients compete from step 1.
-    model.output_head[-1].bias.data[0] = global_mean_affinity
 
     loss_fn   = TNPLoss().to(device)
     all_params = list(model.parameters()) + list(loss_fn.parameters())
@@ -252,7 +248,8 @@ def main():
         model.eval()
         with torch.no_grad():
             mu_eval, sigma_eval = run_episode(
-                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs
+                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
+                global_mean_affinity=global_mean_affinity,
             )
         ci_val     = calculate_ci(ep.labels, mu_eval)
         ef10_val   = calculate_ef_at_k(ep.labels, mu_eval, k=0.1)
@@ -275,7 +272,8 @@ def main():
             loss_fn.step_schedule(i, len(episodes))
 
             mu_train, sigma_train = run_episode(
-                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs
+                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
+                global_mean_affinity=global_mean_affinity,
             )
             train_result = loss_fn(mu_train, sigma_train, ep.labels.to(device))
             train_result["total_loss"].backward()
@@ -296,7 +294,8 @@ def main():
                 replay_total = torch.tensor(0.0, device=device)
                 for _, r_edges, r_labels, r_pillar in replay_batches:
                     r_mu, r_sigma = run_episode(
-                        model, builder, drug_features, r_pillar, r_edges[1], gnn_all_embs
+                        model, builder, drug_features, r_pillar, r_edges[1], gnn_all_embs,
+                        global_mean_affinity=global_mean_affinity,
                     )
                     r_result     = loss_fn(r_mu, r_sigma, r_labels.to(device))
                     replay_total = replay_total + r_result["total_loss"]
