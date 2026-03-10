@@ -332,12 +332,13 @@ class ProteinLigandTNP(nn.Module):
             ctx_mean = torch.tensor(global_mean_affinity, dtype=torch.float32, device=device)
         mu = mu + ctx_mean
 
-        # Unit 7: add binding encoder contribution, density-gated.
-        # Cold-start (density≈0): binding_prior contributes fully — direct
-        # protein-drug features carry the ranking signal.
-        # Warm (density→1): contribution fades to zero — transformer's
-        # neighbor-transfer signal takes over completely.
-        mu = mu + binding_prior * (1.0 - density)
+        # Unit 7: add binding encoder contribution unconditionally.
+        # Context and direct binding features are complementary, not substitutes:
+        # context answers "what did similar proteins bind?", binding_prior answers
+        # "do THIS protein's pocket features match THIS drug's scaffold?".
+        # The last layer is zero-initialised so it starts as a no-op and only
+        # grows when it genuinely reduces the loss — no manual gating needed.
+        mu = mu + binding_prior
 
         # Unit 3: cold-start sigma bias — upward uncertainty when n_ctx is small
         # Bias decays to zero as density → 1 (warm regime)
