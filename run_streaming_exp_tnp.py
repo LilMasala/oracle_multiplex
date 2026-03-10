@@ -214,10 +214,15 @@ def main():
 
 
     loss_fn   = TNPLoss().to(device)
-    all_params = list(model.parameters()) + list(loss_fn.parameters())
+    model_params = list(model.parameters())
     if protein_gnn is not None:
-        all_params += list(protein_gnn.parameters())
-    optimizer = Adam(all_params, lr=args.lr)
+        model_params += list(protein_gnn.parameters())
+    # log_var scalars are three lightweight calibration parameters — they need
+    # to adapt much faster than the transformer weights to be effective.
+    optimizer = Adam([
+        {"params": model_params,               "lr": args.lr},
+        {"params": list(loss_fn.parameters()), "lr": args.lr * 10},
+    ])
 
     print("\nSTARTING TNP PREQUENTIAL STREAM")
     print(f"  synthetic prior: {args.enable_synthetic_prior}")
@@ -348,7 +353,7 @@ def main():
                 f" | CI: {ci_val:.3f} (roll100: {ci_roll:.3f})"
                 f" | σ: {mean_sigma:.3f}"
                 f" | n_ctx: {n_ctx}"
-                f" | weights -> NLL: {w_nll:.2f}, ListNet: {w_listnet:.2f}, Lambda: {w_lambda:.2f}"
+                f" | weights -> NLL: {w_nll:.4f}, ListNet: {w_listnet:.4f}, Lambda: {w_lambda:.4f}"
             )
 
     print("\nSaving TNP model...")
