@@ -275,6 +275,107 @@ class TNPContextBuilder:
 
         return ctx_protein, ctx_drug, ctx_affinity, ctx_ppr, ctx_trust, ctx_gnn_emb
 
+    def build_per_query_context(
+        self,
+        pillar: dict,
+        query_drug_indices: torch.Tensor,   # [N_qry]
+        per_query_k: int = 64,
+        max_pool: int = 4096,
+    ):
+        """
+        Per-query dynamic context (Unit 8).
+
+        Instead of one shared context set for all query drugs, each query drug
+        gets its own K tokens selected from the full pool by:
+            score(q, ctx) = cosine_sim(drug_q, drug_ctx) × ppr_ctx
+
+        Returns:
+            pq_protein:  [N_qry, K, protein_dim]
+            pq_drug:     [N_qry, K, drug_dim]
+            pq_affinity: [N_qry, K, 1]
+            pq_ppr:      [N_qry, K]
+            pq_trust:    [N_qry, K]
+            pq_gnn:      [N_qry, K, gnn_dim] or None
+            pq_aff_mean: [N_qry]  per-query context affinity mean for anchoring
+        """
+        device     = pillar["target_features"].device
+        protein_dim = pillar["target_features"].size(0)
+        drug_dim   = self.drug_features.size(1)
+        N_qry      = query_drug_indices.size(0)
+
+        # 1. Collect full pool without subsampling
+        prot_parts, drug_parts, aff_parts = [], [], []
+        ppr_parts, trust_parts, gnn_parts = [], [], []
+
+        for layer in ("form", "role"):
+            p, d, a, ppr, trust, _, gnn = self._collect_layer(
+                pillar[f"{layer}_neighbors"],
+                pillar[f"{layer}_features"],
+                pillar[f"{layer}_diff_w"],
+                pillar[f"{layer}_binds_ei"],
+                pillar[f"{layer}_binds_y"],
+                pillar[f"{layer}_binds_w"],
+            )
+            prot_parts.extend(p); drug_parts.extend(d); aff_parts.extend(a)
+            ppr_parts.extend(ppr); trust_parts.extend(trust); gnn_parts.extend(gnn)
+
+        if not prot_parts:
+            # Cold-start: return zero context, anchor to global mean
+            K = per_query_k
+            return (
+                torch.zeros(N_qry, K, protein_dim, device=device),
+                torch.zeros(N_qry, K, drug_dim,    device=device),
+                torch.zeros(N_qry, K, 1,            device=device),
+                torch.zeros(N_qry, K,               device=device),
+                torch.zeros(N_qry, K,               device=device),
+                None,
+                torch.full((N_qry,), self.global_mean_affinity, device=device),
+            )
+
+        pool_protein  = torch.cat(prot_parts, dim=0)
+        pool_drug     = torch.cat(drug_parts, dim=0).to(device)
+        pool_affinity = torch.cat(aff_parts,  dim=0)
+        pool_ppr      = torch.cat(ppr_parts,  dim=0)
+        pool_trust    = torch.cat(trust_parts, dim=0)
+        pool_gnn      = torch.cat(gnn_parts,  dim=0) if gnn_parts else None
+
+        # Subsample pool if huge (PPR-weighted to keep best candidates)
+        P = pool_protein.size(0)
+        if P > max_pool:
+            idx = torch.multinomial(pool_ppr.clamp(min=1e-8), max_pool, replacement=False)
+            pool_protein  = pool_protein[idx]
+            pool_drug     = pool_drug[idx]
+            pool_affinity = pool_affinity[idx]
+            pool_ppr      = pool_ppr[idx]
+            pool_trust    = pool_trust[idx]
+            if pool_gnn is not None:
+                pool_gnn = pool_gnn[idx]
+            P = max_pool
+
+        # 2. Score: cosine_sim(query_drug, pool_drug) × PPR  →  [N_qry, P]
+        qry_feats  = self.drug_features[query_drug_indices].to(device).float()
+        qry_norm   = torch.nn.functional.normalize(qry_feats, dim=1)
+        pool_norm  = torch.nn.functional.normalize(pool_drug.float(), dim=1)
+        drug_sims  = (qry_norm @ pool_norm.T + 1.0) / 2.0             # [N_qry, P], in [0,1]
+        scores     = drug_sims * pool_ppr.unsqueeze(0)                 # [N_qry, P]
+
+        # 3. Top-K per query
+        K = min(per_query_k, P)
+        _, topk_idx = torch.topk(scores, K, dim=1)                    # [N_qry, K]
+
+        # 4. Gather per-query context
+        pq_protein  = pool_protein[topk_idx]                          # [N_qry, K, protein_dim]
+        pq_drug     = pool_drug[topk_idx]                             # [N_qry, K, drug_dim]
+        pq_affinity = pool_affinity[topk_idx]                         # [N_qry, K, 1]
+        pq_ppr      = pool_ppr[topk_idx]                              # [N_qry, K]
+        pq_trust    = pool_trust[topk_idx]                            # [N_qry, K]
+        pq_gnn      = pool_gnn[topk_idx] if pool_gnn is not None else None
+
+        # Per-query anchor: mean affinity of each drug's own context
+        pq_aff_mean = pq_affinity.squeeze(-1).mean(dim=1)             # [N_qry]
+
+        return pq_protein, pq_drug, pq_affinity, pq_ppr, pq_trust, pq_gnn, pq_aff_mean
+
 
 if __name__ == "__main__":
     drug_features = torch.randn(1000, 512)

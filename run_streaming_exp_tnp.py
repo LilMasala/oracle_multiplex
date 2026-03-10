@@ -63,32 +63,42 @@ def sample_replay_batch(
 
 
 def run_episode(model, builder, drug_features, pillar, query_drug_indices,
-                gnn_all_embs=None, global_mean_affinity=6.5):
+                gnn_all_embs=None, global_mean_affinity=6.5, per_query_k=0):
     """
     Forward pass for one protein episode. Returns (mu, sigma).
 
     Args:
-        gnn_all_embs: [N_proteins, gnn_dim] precomputed GNN embeddings or None (Unit 6)
+        gnn_all_embs:       [N_proteins, gnn_dim] precomputed GNN embeddings or None
         global_mean_affinity: fallback anchor for cold-start (n_ctx == 0)
+        per_query_k:        >0 → use per-query dynamic context (Unit 8)
     """
-    # Build context (6-tuple; last element is ctx_gnn_emb or None)
-    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn = builder.build_context(
-        pillar, query_drug_indices
-    )
+    target       = pillar["target_features"]
+    ppr_centroid = pillar.get("ppr_centroid")
+    n_q          = query_drug_indices.size(0)
+    qry_protein  = target.unsqueeze(0).expand(n_q, -1)
+    qry_drug     = drug_features[query_drug_indices]
 
-    target      = pillar["target_features"]
-    ppr_centroid = pillar.get("ppr_centroid")  # Unit 4: may be None
-
-    n_q        = query_drug_indices.size(0)
-    qry_protein = target.unsqueeze(0).expand(n_q, -1)
-    qry_drug    = drug_features[query_drug_indices]
-
-    # Unit 6: GNN embeddings for target protein
     qry_gnn_emb = None
     if gnn_all_embs is not None:
         target_idx  = int(pillar["target_idx"])
         qry_gnn_emb = gnn_all_embs[target_idx].unsqueeze(0).expand(n_q, -1)
 
+    if per_query_k > 0:
+        # Unit 8: per-query dynamic context
+        pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean = \
+            builder.build_per_query_context(pillar, query_drug_indices, per_query_k)
+        return model.forward_per_query(
+            pq_p, pq_d, pq_a, pq_ppr, pq_trust,
+            qry_protein, qry_drug, pq_aff_mean,
+            pq_gnn_emb=pq_gnn,
+            qry_gnn_emb=qry_gnn_emb,
+            ppr_centroid=ppr_centroid,
+        )
+
+    # Shared context path (default)
+    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn = builder.build_context(
+        pillar, query_drug_indices
+    )
     return model(
         ctx_p, ctx_d, ctx_a,
         qry_protein, qry_drug,
@@ -124,6 +134,10 @@ def main():
                         help="Enable drug analog context injection (Unit 5)")
     parser.add_argument("--analog-top-k", type=int, default=32,
                         help="Top-K analogues per drug (Unit 5)")
+
+    # Unit 8: per-query dynamic context
+    parser.add_argument("--per-query-k", type=int, default=0,
+                        help="Per-query context size >0 enables Unit 8 (default: 0 = shared)")
 
     # Unit 6: GNN pre-encoder
     parser.add_argument("--use-gnn", action="store_true",
@@ -223,6 +237,7 @@ def main():
     print(f"  drug analogs:    {args.drug_analogs}")
     print(f"  GNN pre-encoder: {args.use_gnn}")
     print(f"  cold-start only: {args.cold_start_only}")
+    print(f"  per-query-k:     {args.per_query_k} {'(Unit 8 enabled)' if args.per_query_k > 0 else '(shared context)'}")
     print("-" * 70)
 
     os.makedirs("models",   exist_ok=True)
@@ -249,6 +264,7 @@ def main():
             mu_eval, sigma_eval = run_episode(
                 model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
                 global_mean_affinity=global_mean_affinity,
+                per_query_k=args.per_query_k,
             )
         ci_val     = calculate_ci(ep.labels, mu_eval)
         ef10_val   = calculate_ef_at_k(ep.labels, mu_eval, k=0.1)
@@ -273,6 +289,7 @@ def main():
             mu_train, sigma_train = run_episode(
                 model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
                 global_mean_affinity=global_mean_affinity,
+                per_query_k=args.per_query_k,
             )
             train_result = loss_fn(mu_train, sigma_train, ep.labels.to(device))
             train_result["total_loss"].backward()
@@ -295,6 +312,7 @@ def main():
                     r_mu, r_sigma = run_episode(
                         model, builder, drug_features, r_pillar, r_edges[1], gnn_all_embs,
                         global_mean_affinity=global_mean_affinity,
+                        per_query_k=args.per_query_k,
                     )
                     r_result     = loss_fn(r_mu, r_sigma, r_labels.to(device))
                     replay_total = replay_total + r_result["total_loss"]

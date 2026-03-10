@@ -37,14 +37,15 @@ class GraphBiasedMHA(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,           # [1, N, D]
+        x: torch.Tensor,           # [B, N, D]  B=1 shared mode, B=N_qry per-query mode
         n_ctx: int,
-        ctx_ppr: torch.Tensor,     # [n_ctx]
-        ctx_trust: torch.Tensor,   # [n_ctx]
+        ctx_ppr: torch.Tensor,     # [n_ctx] shared  OR  [B, n_ctx] per-query
+        ctx_trust: torch.Tensor,   # [n_ctx] shared  OR  [B, n_ctx] per-query
         attn_mask: torch.Tensor | None = None,  # [N, N] bool, True=blocked
     ) -> torch.Tensor:
         B, N, D = x.shape
         H, d = self.nhead, self.head_dim
+        per_query = ctx_ppr.dim() == 2   # True when ctx_ppr is [B, K]
 
         qkv = self.in_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -53,25 +54,33 @@ class GraphBiasedMHA(nn.Module):
         k = k.view(B, N, H, d).transpose(1, 2)
         v = v.view(B, N, H, d).transpose(1, 2)
 
-        # V gate for context tokens (applied before SDPA, no change needed)
+        # V gate for context tokens
         if n_ctx > 0:
-            gate = torch.sigmoid(self.trust_scale * ctx_trust)  # [n_ctx]
-            ones = torch.ones(N - n_ctx, device=x.device)
-            gate_full = torch.cat([gate, ones], dim=0)           # [N]
-            v = v * gate_full.view(1, 1, N, 1)
+            gate = torch.sigmoid(self.trust_scale * ctx_trust)  # [K] or [B, K]
+            if per_query:
+                ones = torch.ones(B, N - n_ctx, device=x.device)
+                gate_full = torch.cat([gate, ones], dim=1)       # [B, N]
+                v = v * gate_full.view(B, 1, N, 1)
+            else:
+                ones = torch.ones(N - n_ctx, device=x.device)
+                gate_full = torch.cat([gate, ones], dim=0)       # [N]
+                v = v * gate_full.view(1, 1, N, 1)
 
         # Build combined additive bias: PPR column logit bonus + block mask.
-        # Float attn_bias lets PyTorch pick the most efficient SDPA kernel
-        # (xformers mem_efficient_attention on H100 supports arbitrary float bias).
-        # When n_ctx==0 and no block mask we pass None → pure FlashAttention.
+        # [B, 1, N, N] broadcasts over heads; pure FlashAttention when bias=None.
         bias = None
         if n_ctx > 0 or attn_mask is not None:
-            bias = torch.zeros(1, 1, N, N, device=x.device, dtype=x.dtype)
+            bias = torch.zeros(B, 1, N, N, device=x.device, dtype=x.dtype)
             if n_ctx > 0:
                 col_bias = -self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))
-                pad = torch.zeros(N - n_ctx, device=x.device)
-                col_bias_full = torch.cat([col_bias, pad], dim=0)       # [N]
-                bias = bias + col_bias_full.view(1, 1, 1, N)
+                if per_query:
+                    pad = torch.zeros(B, N - n_ctx, device=x.device)
+                    col_bias_full = torch.cat([col_bias, pad], dim=1)    # [B, N]
+                    bias = bias + col_bias_full.view(B, 1, 1, N)
+                else:
+                    pad = torch.zeros(N - n_ctx, device=x.device)
+                    col_bias_full = torch.cat([col_bias, pad], dim=0)    # [N]
+                    bias = bias + col_bias_full.view(1, 1, 1, N)
             if attn_mask is not None:
                 bias = bias.masked_fill(attn_mask.view(1, 1, N, N), float("-inf"))
 
@@ -348,6 +357,87 @@ class ProteinLigandTNP(nn.Module):
         # Bias decays to zero as density → 1 (warm regime)
         log_sigma = log_sigma + self.cold_start_bias * (1.0 - density)
         sigma = F.softplus(log_sigma) + 1e-4
+
+        return mu, sigma
+
+    def forward_per_query(
+        self,
+        pq_protein:  torch.Tensor,          # [N_qry, K, protein_dim]
+        pq_drug:     torch.Tensor,          # [N_qry, K, drug_dim]
+        pq_affinity: torch.Tensor,          # [N_qry, K, 1]
+        pq_ppr:      torch.Tensor,          # [N_qry, K]
+        pq_trust:    torch.Tensor,          # [N_qry, K]
+        qry_protein: torch.Tensor,          # [N_qry, protein_dim]
+        qry_drug:    torch.Tensor,          # [N_qry, drug_dim]
+        pq_aff_mean: torch.Tensor,          # [N_qry]  per-query context affinity mean
+        pq_gnn_emb:  Optional[torch.Tensor] = None,  # [N_qry, K, gnn_dim]
+        qry_gnn_emb: Optional[torch.Tensor] = None,  # [N_qry, gnn_dim]
+        ppr_centroid: Optional[torch.Tensor] = None,
+    ):
+        """
+        Per-query dynamic context forward pass.
+
+        Each query drug attends to its own K context tokens selected by
+        drug_sim × PPR, rather than a shared pool.  Transformer runs as a
+        batch of [N_qry, K+1, D] sequences — fully parallel.
+        """
+        N_qry, K = pq_protein.shape[:2]
+        device = qry_protein.device
+
+        density = math.tanh(K / 32.0)
+
+        # Unit 4: PPR centroid blending
+        if ppr_centroid is not None:
+            alpha_eff = torch.sigmoid(self.centroid_alpha) * (1.0 - density)
+            qry_protein = (1.0 - alpha_eff) * qry_protein + alpha_eff * ppr_centroid.unsqueeze(0)
+
+        # Unit 7: binding prior (direct features, detached for transformer path)
+        binding_prior = self.binding_encoder(qry_protein, qry_drug)   # [N_qry]
+
+        # --- Encode context tokens (flatten → encode → reshape) ---
+        pq_p_flat   = pq_protein.reshape(N_qry * K, -1)
+        pq_d_flat   = pq_drug.reshape(N_qry * K, -1)
+        pq_a_flat   = pq_affinity.reshape(N_qry * K, 1)
+        pq_gnn_flat = pq_gnn_emb.reshape(N_qry * K, -1) if pq_gnn_emb is not None else None
+
+        ctx_tokens = self._encode_context(pq_p_flat, pq_d_flat, pq_a_flat, pq_gnn_flat)
+        ctx_tokens = ctx_tokens.view(N_qry, K, -1)                    # [N_qry, K, D]
+        ctx_tokens = ctx_tokens + self.type_embed(
+            torch.zeros(K, dtype=torch.long, device=device)
+        ).unsqueeze(0)                                                 # broadcast over N_qry
+
+        # --- Encode query tokens ---
+        qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb)   # [N_qry, D]
+        qry_tokens = qry_tokens + self.type_embed(
+            torch.ones(N_qry, dtype=torch.long, device=device)
+        )
+        # Inject binding prior hint (detached) and density signal
+        qry_tokens = qry_tokens + self.prior_proj(binding_prior.detach().unsqueeze(-1))
+        density_t  = torch.tensor([[density]], dtype=torch.float32, device=device)
+        qry_tokens = qry_tokens + self.density_proj(density_t)        # broadcast
+
+        # --- Combine: [N_qry, K+1, D] ---
+        tokens = torch.cat([ctx_tokens, qry_tokens.unsqueeze(1)], dim=1)
+
+        # Mask: context tokens cannot attend to the query (last position)
+        mask = torch.zeros(K + 1, K + 1, dtype=torch.bool, device=device)
+        mask[:K, K] = True
+
+        # --- Transformer (per-query PPR/trust are [N_qry, K] → 2D mode) ---
+        for layer in self.layers:
+            tokens = layer(tokens, K, pq_ppr, pq_trust, attn_mask=mask)
+        tokens  = self.final_norm(tokens)       # [N_qry, K+1, D]
+        qry_out = tokens[:, K, :]               # [N_qry, D]
+
+        pred      = self.output_head(qry_out)   # [N_qry, 2]
+        mu        = pred[:, 0]
+        log_sigma = pred[:, 1]
+
+        # Per-query affinity anchoring: each drug anchors to its own context mean
+        mu = mu + pq_aff_mean + binding_prior
+
+        log_sigma = log_sigma + self.cold_start_bias * (1.0 - density)
+        sigma     = F.softplus(log_sigma) + 1e-4
 
         return mu, sigma
 
