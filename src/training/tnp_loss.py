@@ -1,21 +1,17 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class TNPLoss(nn.Module):
-    def __init__(
-        self,
-        rank_weight: float = 0.3,
-        nll_weight: float = 1.0,
-        lambda_rank_weight: float = 0.1,
-    ):
+    def __init__(self):
         super().__init__()
-        self.rank_weight = rank_weight
-        self.nll_weight = nll_weight
-        self.lambda_rank_weight = lambda_rank_weight
+        # Learnable log-variances for homoscedastic uncertainty weighting
+        # Initializing at 0 means the initial weight is exp(0) = 1.0
+        self.log_var_nll = nn.Parameter(torch.zeros(1))
+        self.log_var_listnet = nn.Parameter(torch.zeros(1))
+        self.log_var_lambda = nn.Parameter(torch.zeros(1))
 
     def step_schedule(self, episode: int, total_episodes: int):
         pass
@@ -43,9 +39,16 @@ class TNPLoss(nn.Module):
         else:
             lambda_loss = torch.tensor(0.0, device=mu.device)
 
+        # Homoscedastic Uncertainty Weighting
+        # Formula: L_weighted = exp(-log_var) * L + 0.5 * log_var
+        w_nll = torch.exp(-self.log_var_nll)
+        w_listnet = torch.exp(-self.log_var_listnet)
+        w_lambda = torch.exp(-self.log_var_lambda)
+
         total = (
-            self.nll_weight * nll_loss
-            + self.rank_weight * (listnet_loss + self.lambda_rank_weight * lambda_loss)
+            (w_nll * nll_loss + 0.5 * self.log_var_nll)
+            + (w_listnet * listnet_loss + 0.5 * self.log_var_listnet)
+            + (w_lambda * lambda_loss + 0.5 * self.log_var_lambda)
         )
 
         return {
@@ -53,4 +56,7 @@ class TNPLoss(nn.Module):
             "nll": nll_loss.detach(),
             "listnet": listnet_loss.detach(),
             "lambda": lambda_loss.detach(),
+            "w_nll": w_nll.detach(),          # Track these to watch them evolve
+            "w_listnet": w_listnet.detach(),
+            "w_lambda": w_lambda.detach(),
         }

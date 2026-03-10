@@ -25,13 +25,21 @@ class GraphBiasedMHA(nn.Module):
         self.out_proj = nn.Linear(token_dim, token_dim, bias=True)
 
         # Learnable graph-bias scalars
-        self.log_ppr_alpha = nn.Parameter(torch.zeros(1))   # α in α·log(ppr)
-        self.trust_scale   = nn.Parameter(torch.zeros(1))   # s in sigmoid(s·decay)
+        # Initialize slightly above zero so the network "feels" the graph immediately
+        self.log_ppr_alpha = nn.Parameter(torch.ones(1) * 0.1)   # α in α·log(ppr)
+        self.trust_scale   = nn.Parameter(torch.ones(1) * 0.1)   # s in sigmoid(s·decay)
 
         # Learned projection from protein_dim delta → scalar bias per context token
+        # Upgraded to an MLP for non-linear deduction of structural feature spaces
         if protein_dim > 0:
-            self.delta_proj = nn.Linear(protein_dim, 1, bias=False)
-            nn.init.zeros_(self.delta_proj.weight)
+            self.delta_proj = nn.Sequential(
+                nn.Linear(protein_dim, token_dim // 2),
+                nn.GELU(),
+                nn.Linear(token_dim // 2, 1)
+            )
+            # Initialize the final layer to small values to prevent initial logit explosion
+            nn.init.normal_(self.delta_proj[-1].weight, std=0.01)
+            nn.init.zeros_(self.delta_proj[-1].bias)
         else:
             self.delta_proj = None
 

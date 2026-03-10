@@ -72,10 +72,10 @@ def main():
     parser.add_argument("--data", default="data/final_graph_data_not_normalized.pt")
     parser.add_argument("--priors", default="data/multiplex_priors.pt")
     parser.add_argument("--n-episodes", type=int, default=None, help="Limit number of episodes (default: all)")
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=5e-3)
     parser.add_argument("--token-dim", type=int, default=256)
     parser.add_argument("--max-context", type=int, default=256)
-    parser.add_argument("--replay-weight", type=float, default=0.25)
+    parser.add_argument("--replay-weight", type=float, default=0.5)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,7 +99,7 @@ def main():
 
     builder = TNPContextBuilder(drug_features, max_context=args.max_context)
     model = ProteinLigandTNP(prot_dim, drug_dim, token_dim=args.token_dim).to(device)
-    loss_fn = TNPLoss(rank_weight=0.3)
+    loss_fn =  TNPLoss()
     optimizer = Adam(model.parameters(), lr=args.lr)
 
     print("\nSTARTING TNP PREQUENTIAL STREAM")
@@ -115,7 +115,7 @@ def main():
     episode_log = []
     ci_history  = []
     ef10_history = []
-    ROLL = 50  # rolling window size
+    ROLL = 100 # rolling window size
 
     for i, ep in enumerate(episodes):
         loader.begin_episode(i)
@@ -136,6 +136,7 @@ def main():
         ef10_roll = float(sum(ef10_history[-ROLL:]) / len(ef10_history[-ROLL:]))
 
         # --- TRAINING ---
+        # --- TRAINING ---
         model.train()
         optimizer.zero_grad()
         loss_fn.step_schedule(i, len(episodes))
@@ -144,12 +145,18 @@ def main():
         mu_train, sigma_train = run_episode(model, builder, drug_features, pillar, ep.edges[1])
         train_result = loss_fn(mu_train, sigma_train, ep.labels.to(device))
         train_result["total_loss"].backward()
+        
         train_loss = float(train_result["total_loss"].detach())
         nll_val    = float(train_result["nll"].detach())
+        
+        # Extract the deduced weights
+        w_nll = float(train_result["w_nll"])
+        w_listnet = float(train_result["w_listnet"])
+        w_lambda = float(train_result["w_lambda"])
 
         # Experience replay
         replay_batches = sample_replay_batch(loader, ep.protein_idx,
-                                             replay_edges_per_protein=256, max_replay_proteins=1)
+                                             replay_edges_per_protein=256, max_replay_proteins=25)
         replay_loss_val = 0.0
         if replay_batches:
             replay_total = torch.tensor(0.0, device=device)
@@ -174,23 +181,25 @@ def main():
             "protein_idx": ep.protein_idx,
             "ci": ci_val,
             "ef10": ef10_val,
-            "ci_roll50": ci_roll,
-            "ef10_roll50": ef10_roll,
+            "ci_roll100": ci_roll,
+            "ef10_roll100": ef10_roll,
             "mean_sigma": mean_sigma,
             "total_loss": train_loss,
             "nll": nll_val,
             "replay_loss": replay_loss_val,
             "n_ctx": n_ctx,
             "n_preds": ep.labels.numel(),
+            "w_nll": w_nll,
+            "w_listnet": w_listnet,
+            "w_lambda": w_lambda,
         })
 
         if i % 5 == 0:
             print(
                 f"ep {i:04d}/{len(episodes)} "
-                f"| CI: {ci_val:.3f} (roll50: {ci_roll:.3f}) "
-                f"| EF10: {ef10_val:.2f} (roll50: {ef10_roll:.2f}) "
-                f"| σ: {mean_sigma:.3f} | nll: {nll_val:.3f} "
-                f"| ctx: {n_ctx}"
+                f"| CI: {ci_val:.3f} (roll100: {ci_roll:.3f}) "
+                f"| σ: {mean_sigma:.3f} "
+                f"| weights -> NLL: {w_nll:.2f}, ListNet: {w_listnet:.2f}, Lambda: {w_lambda:.2f}"
             )
 
     print("\nSaving TNP model...")
