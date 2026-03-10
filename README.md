@@ -6,39 +6,41 @@ A drug discovery system for cold-start protein-ligand binding affinity predictio
 
 The core challenge in virtual screening is the **cold-start problem**: new or under-characterized proteins lack binding data, making standard supervised models unreliable. Oracle Multiplex addresses this with:
 
-- **Inductive Multiplex Mixture-of-Experts (MoE)**: routes each protein to specialized expert scorers based on its multiplex neighborhood context
-- **Chemical Footprinting**: aggregates binding preference signals from structurally/functionally similar proteins via cross-attention
-- **Prequential Protocol**: evaluates the model in a test-then-train streaming loop that mirrors real laboratory conditions—each protein episode is encountered once, ranked blindly, then used for learning
-- **Bayesian Expert Routing**: a Dirichlet Process Mixture Model (DPMM) provides a principled probabilistic prior over expert assignments, with variational inference via Pyro
+- **Transformer Neural Process (TNP)**: a probabilistic model that treats known neighbor-binding tuples as a context set and outputs a predictive distribution over affinity for each query drug — explicitly representing uncertainty
+- **Graph-Biased Attention**: attention weights incorporate PPR scores (diffusion proximity), structural delta (target–neighbor difference), and temporal decay — directly encoding graph structure into the information-gathering mechanism
+- **Prequential Protocol**: evaluates the model in a test-then-train streaming loop that mirrors real laboratory conditions — each protein episode is encountered once, ranked blindly, then used for learning
+- **Experience Replay**: historical protein episodes are sampled and replayed during training to mitigate forgetting in the sequential setting
 
 ## Architecture
 
 ```
-MultiplexPillarSampler          # Fetches structural/functional neighbors + trust vectors
+MultiplexPillarSampler          # Fetches structural/functional neighbors, PPR scores, trust weights
         │
         ▼
-MultiplexInductiveSmoother      # Chemical footprinting: cross-attention over neighbor binding histories
+TNPContextBuilder               # Assembles context set: (protein, drug, affinity, ppr, delta, trust)
         │
         ▼
-BayesianMultiplexRouter         # DPMM-based probabilistic routing to K expert scorers
+ProteinLigandTNP                # Graph-biased Transformer Neural Process
+  ├── Context encoder           # (protein, drug, affinity) → token
+  ├── Query encoder             # (protein, drug) → token
+  ├── GraphBiasedTransformer    # PPR + delta logit biases; trust V-gate
+  └── Output head               # token → (mu, sigma)
         │
         ▼
-ExpertScorer × K                # Bilinear affinity prediction heads
-        │
-        ▼
-EBLLoss                         # Explanation-based learning: oracle routing supervision + ranking losses
+TNPLoss                         # Gaussian NLL + ListNet + Lambda-MART ranking losses
 ```
 
 ### Key Components
 
 | Module | File | Description |
 |---|---|---|
-| `MultiplexPillarSampler` | `src/data/multiplex_loader.py` | Builds per-protein context: neighbors, trust vectors, PPR centroids |
-| `MultiplexInductiveSmoother` | `src/models/smoothing.py` | Cross-attention aggregation of neighbor binding preferences |
-| `BayesianMultiplexRouter` | `src/models/routing.py` | Stick-breaking DPMM with variational Beta/Gamma posteriors |
-| `ExpertScorer` | `src/models/routing.py` | Per-expert bilinear affinity scoring heads |
-| `EBLLoss` | `src/training/ebl_loss.py` | Oracle gate supervision + ListNet/Lambda-MART ranking losses |
+| `MultiplexPillarSampler` | `src/data/multiplex_loader.py` | Builds per-protein context: neighbors, PPR scores, trust vectors, temporal decay weights |
+| `TNPContextBuilder` | `src/data/context_builder.py` | Converts pillar dicts to TNP context tensors including ppr, delta, trust per edge |
+| `ProteinLigandTNP` | `src/models/tnp.py` | Graph-biased TNP with learnable PPR/delta/trust attention parameters |
+| `GraphBiasedMHA` | `src/models/tnp.py` | Multi-head attention with additive logit biases and multiplicative V gate |
+| `TNPLoss` | `src/training/tnp_loss.py` | NLL + ListNet + Lambda-MART composite ranking loss |
 | `build_multiplex_stream` | `src/protocol/prequential.py` | Constructs sequential protein episodes for streaming evaluation |
+| `BayesianMultiplexRouter` | `src/models/routing.py` | (Legacy v1) Stick-breaking DPMM with variational Beta/Gamma posteriors |
 
 ## Installation
 
@@ -60,8 +62,8 @@ The following files are expected under `data/`:
 | File | Description |
 |---|---|
 | `data/final_graph_data_not_normalized.pt` | Heterogeneous PyG graph with protein, drug nodes and binding edges |
-| `data/multiplex_priors.pt` | Pre-computed PPR scores and trust metrics |
-| `data/dpmm_init.pt` | (Optional) Offline DPMM initialization checkpoint |
+| `data/multiplex_priors.pt` | Pre-computed PPR scores, trust metrics, PPR centroids |
+| `data/dpmm_init.pt` | (Optional) Offline DPMM initialization checkpoint for legacy v1 |
 
 The graph contains three edge types:
 - `similar` — structural similarity between proteins
@@ -70,9 +72,37 @@ The graph contains three edge types:
 
 ## Usage
 
-### 1. (Optional) Pre-initialize the DPMM
+### 1. Run the TNP Prequential Streaming Experiment
 
-Runs offline clustering to warm-start the Bayesian router before streaming:
+```bash
+python run_streaming_exp_tnp.py \
+    --data data/final_graph_data_not_normalized.pt \
+    --priors data/multiplex_priors.pt
+```
+
+For each protein episode:
+1. **Evaluate**: rank all candidate drugs cold-start (no binding labels seen yet)
+2. **Train**: optimize on revealed labels + replayed historical data
+3. **Update**: add new edges to the growing information base
+
+Outputs:
+- `results/stream_tnp_v1.csv` — per-episode CI, EF@10, NLL and loss breakdown
+- `models/oracle_tnp_v1.pt` — final model weights
+- `models/tnp_checkpoint_ep*.pt` — checkpoints every 50 episodes
+
+Key arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--lr` | `5e-4` | Adam learning rate |
+| `--token-dim` | `256` | Transformer token dimensionality |
+| `--max-context` | `256` | Max neighbor binding tuples in context set |
+| `--replay-weight` | `0.25` | Experience replay loss scaling |
+| `--n-episodes` | all | Limit episodes for quick testing |
+
+### 2. (Optional) Pre-initialize the DPMM (Legacy v1)
+
+Pre-trains the Bayesian router with offline protein clustering before streaming:
 
 ```bash
 python scripts/pretrain_dpmm.py \
@@ -83,39 +113,11 @@ python scripts/pretrain_dpmm.py \
     --output data/dpmm_init.pt
 ```
 
-### 2. Run the Prequential Streaming Experiment
-
-```bash
-python run_streaming_exp.py
-```
-
-For each protein episode:
-1. **Evaluate**: rank all candidate drugs cold-start (no binding labels seen)
-2. **Train**: optimize on revealed labels + replayed historical data
-3. **Update**: add new edges to the growing information base
-
-Outputs:
-- `results/stream_analysis_v1.csv` — per-episode CI, EF@10, and loss breakdown
-- `models/oracle_multiplex_v1.pt` — final model weights
-- `models/checkpoint_ep*.pt` — checkpoints every 50 episodes
-
 ### 3. Interactive Notebook
 
 ```bash
 jupyter notebook run_streaming_exp.ipynb
 ```
-
-### Key Hyperparameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `lr` | `5e-4` | Adam learning rate |
-| `max_experts` | `16` | Number of expert scorers |
-| `elbo_weight` | `0.1` | DPMM ELBO loss scaling |
-| `ebl_alpha` | `0.3` | Gate supervision loss weight |
-| `replay_weight` | `0.25` | Experience replay loss scaling |
-| `support_batch_size` | `128` | Mini-batch size during training |
-| `temperature` | `0.1` | EBL oracle distribution temperature |
 
 ## Evaluation Metrics
 
@@ -124,31 +126,55 @@ jupyter notebook run_streaming_exp.ipynb
 
 ## Technical Details
 
-### Chemical Footprinting
+### Transformer Neural Process
 
-For each neighbor protein `P_n`, a binding preference vector is constructed by projecting its known drug interactions into chemical space, weighted by temporal decay and attention scores over the target-neighbor similarity. These are aggregated via cross-attention to produce `v_prior`.
+The TNP frames binding prediction as in-context learning. For a new target protein with no binding data, the model:
 
-### Trust-Aware Routing
+1. Assembles a **context set** of `(neighbor_protein, drug, affinity)` triples from structurally/functionally related proteins
+2. Encodes each triple as a token; encodes each `(target_protein, drug)` query pair as a token
+3. Runs cross-attention (context → queries) so each query reads from the most relevant context items
+4. Predicts a **Gaussian distribution** `(mu, sigma)` over affinity per query drug
 
-The router receives a 5-dimensional trust vector per neighbor:
+The explicit `sigma` output allows the model to express uncertainty — useful for active learning and multi-round screening.
 
+### Graph-Biased Attention
+
+Rather than treating all neighbor-binding tuples as equally informative, three graph signals are injected into the attention mechanism:
+
+**1. PPR logit bias** — Personalized PageRank score (diffusion proximity) of the context neighbor to the target protein:
 ```
-[participation_coefficient, jaccard_overlap, neighbor_count, mean_ppr, binding_density]
+attn_logit(i → ctx_k) += α · log(ppr_k + ε)
 ```
+High-PPR neighbors receive higher attention, so the model naturally up-weights close relatives in the protein graph.
 
-The full gate input is `[z_refined, v_prior, delta_mean, trust_vector]`, producing a sparse top-k routing distribution over K experts.
-
-### Explanation-Based Learning (EBL)
-
-After observing labels, the oracle identifies which expert would have performed best per protein and constructs a soft target distribution:
-
+**2. Structural delta bias** — Projected difference between target and neighbor protein embeddings:
 ```
-oracle_dist = softmax(-MSE_per_expert / temperature)
-target      = (1 - ε) * oracle_dist + ε * uniform
-loss_gate   = CrossEntropy(predicted_gate, target)
+attn_logit(i → ctx_k) += w_delta · (target_emb - neighbor_emb_k)
 ```
+This encourages attention to neighbors that are structurally close (small delta → small bias correction), and lets the model learn which structural dimensions matter for binding transfer.
 
-Combined with ListNet and Lambda-MART ranking surrogates to directly optimize CI.
+**3. Temporal trust gate** — Multiplicative gate on context token values using edge recency:
+```
+v_ctx_k ← sigmoid(s · decay_weight_k) · v_ctx_k
+```
+Old, low-confidence binding edges are downweighted in the value aggregation; fresh or high-confidence edges pass through at full strength.
+
+All three parameters (`α`, `w_delta`, `s`) are learnable and initialized at zero, so the model starts as a standard TNP and gradually learns to exploit graph structure.
+
+### Prequential Protocol
+
+Each protein appears exactly once in streaming order. This simulates a real screening campaign:
+- No look-ahead: ranking happens before labels are revealed
+- Sequential online learning: weights updated after each protein
+- Experience replay: subsample of past proteins replayed to prevent forgetting
+
+### Context Assembly
+
+`TNPContextBuilder` populates the context set from the pillar dict produced by `MultiplexPillarSampler`:
+- Gathers binding edges from `form` (structural similarity) and `role` (GO-term) neighbor layers
+- Filters low-confidence edges (`min_affinity_weight` threshold)
+- Per edge: extracts `ppr` (from `form_diff_w`/`role_diff_w`), `delta` (target − neighbor features), `trust` (decay-weighted edge weight)
+- Subsamples to `max_context` if over budget
 
 ## Project Structure
 
@@ -156,26 +182,28 @@ Combined with ListNet and Lambda-MART ranking surrogates to directly optimize CI
 oracle_multiplex/
 ├── src/
 │   ├── data/
-│   │   ├── multiplex_loader.py   # MultiplexPillarSampler
+│   │   ├── multiplex_loader.py    # MultiplexPillarSampler
+│   │   ├── context_builder.py     # TNPContextBuilder
 │   │   └── make_graph.py
 │   ├── models/
-│   │   ├── multiplex_moe.py      # Top-level MultiplexMoE orchestrator
-│   │   ├── routing.py            # BayesianMultiplexRouter + ExpertScorer
-│   │   └── smoothing.py          # MultiplexInductiveSmoother
+│   │   ├── tnp.py                 # ProteinLigandTNP (graph-biased)
+│   │   ├── multiplex_moe.py       # (Legacy v1) MultiplexMoE orchestrator
+│   │   ├── routing.py             # BayesianMultiplexRouter + ExpertScorer
+│   │   └── smoothing.py           # MultiplexInductiveSmoother
 │   ├── protocol/
-│   │   └── prequential.py        # build_multiplex_stream
+│   │   └── prequential.py         # build_multiplex_stream
 │   └── training/
-│       ├── ebl_loss.py           # EBLLoss
-│       ├── bayesian_training.py  # ELBO construction
-│       ├── metrics.py            # CI, EF@k
+│       ├── tnp_loss.py            # TNPLoss (NLL + ListNet + Lambda-MART)
+│       ├── ebl_loss.py            # (Legacy v1) EBLLoss
+│       ├── bayesian_training.py   # ELBO construction
+│       ├── metrics.py             # CI, EF@k
 │       └── runner.py
 ├── scripts/
-│   ├── pretrain_dpmm.py
+│   ├── pretrain_dpmm.py           # Offline DPMM pre-initialization
 │   ├── precompute_multiplex_stats.py
 │   └── build_base_graph.py
-├── config/
-│   └── default_config.yaml
-├── run_streaming_exp.py          # Main entry point
+├── run_streaming_exp_tnp.py       # Main entry point (TNP)
+├── run_streaming_exp.py           # (Legacy v1) MoE entry point
 ├── run_streaming_exp.ipynb
 └── requirements.txt
 ```
