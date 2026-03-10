@@ -444,6 +444,40 @@ class ProteinLigandTNP(nn.Module):
         # Unit 7: binding prior (direct features, detached for transformer path)
         binding_prior = self.binding_encoder(qry_protein, qry_drug)   # [N_qry]
 
+        if K == 0:
+            qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb, qry_go_fp)
+            qry_tokens = qry_tokens + self.type_embed(
+                torch.ones(N_qry, dtype=torch.long, device=device)
+            )
+            qry_tokens = qry_tokens + self.prior_proj(binding_prior.detach().unsqueeze(-1))
+            density_t = torch.tensor([[density]], dtype=torch.float32, device=device)
+            qry_tokens = qry_tokens + self.density_proj(density_t)
+
+            tokens = qry_tokens.unsqueeze(1)  # [N_qry, 1, D]
+            for layer in self.layers:
+                tokens = layer(
+                    tokens,
+                    0,
+                    torch.zeros(N_qry, 0, device=device),
+                    torch.zeros(N_qry, 0, device=device),
+                    attn_mask=None,
+                )
+            tokens = self.final_norm(tokens)
+            qry_out = tokens[:, 0, :]
+
+            pred = self.output_head(qry_out)
+            mu = pred[:, 0] + pq_aff_mean + binding_prior
+            log_sigma = pred[:, 1] + self.cold_start_bias * (1.0 - density)
+            sigma = F.softplus(log_sigma) + 1e-4
+            self.last_forward_stats = {
+                "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
+                "binding_prior_std": float(binding_prior.detach().std(unbiased=False).item()) if binding_prior.numel() > 1 else 0.0,
+                "log_ppr_alpha": float(self.layers[0].attn.log_ppr_alpha.detach().item()) if self.layers else 0.0,
+                "centroid_alpha": float(self.centroid_alpha.detach().item()),
+                "density": float(density),
+            }
+            return mu, sigma
+
         # --- Encode context tokens (flatten → encode → reshape) ---
         pq_p_flat    = pq_protein.reshape(N_qry * K, -1)
         pq_d_flat    = pq_drug.reshape(N_qry * K, -1)
