@@ -395,6 +395,110 @@ class TNPContextBuilder:
 
         return pq_protein, pq_drug, pq_affinity, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp
 
+    def build_neighbor_transfer_context(
+        self,
+        pillar: dict,
+        query_drug_indices: torch.Tensor,
+        top_k: int = 8,
+    ):
+        """
+        Exact-drug neighbor transfer context.
+
+        For each query drug, gather up to top_k revealed neighbor bindings for
+        that same drug, ranked by PPR × trust. Returns padded tensors plus a
+        boolean mask indicating which neighbor slots are valid.
+        """
+        device = pillar["target_features"].device
+        protein_dim = pillar["target_features"].size(0)
+        drug_dim = self.drug_features.size(1)
+        n_qry = query_drug_indices.size(0)
+        K = max(1, top_k)
+
+        prot_parts, drug_parts, aff_parts = [], [], []
+        ppr_parts, trust_parts, didx_parts, go_fp_parts = [], [], [], []
+        for layer in ("form", "role"):
+            p, d, a, ppr, trust, didx, _, go_fp = self._collect_layer(
+                pillar[f"{layer}_neighbors"],
+                pillar[f"{layer}_features"],
+                pillar[f"{layer}_diff_w"],
+                pillar[f"{layer}_binds_ei"],
+                pillar[f"{layer}_binds_y"],
+                pillar[f"{layer}_binds_w"],
+            )
+            prot_parts.extend(p)
+            drug_parts.extend(d)
+            aff_parts.extend(a)
+            ppr_parts.extend(ppr)
+            trust_parts.extend(trust)
+            didx_parts.extend(didx)
+            go_fp_parts.extend(go_fp)
+
+        neighbor_protein = torch.zeros(n_qry, K, protein_dim, device=device)
+        neighbor_drug = torch.zeros(n_qry, K, drug_dim, device=device)
+        neighbor_affinity = torch.zeros(n_qry, K, device=device)
+        neighbor_ppr = torch.zeros(n_qry, K, device=device)
+        neighbor_trust = torch.zeros(n_qry, K, device=device)
+        neighbor_mask = torch.zeros(n_qry, K, dtype=torch.bool, device=device)
+        matched_counts = torch.zeros(n_qry, dtype=torch.long, device=device)
+
+        if self.go_fingerprints is not None:
+            go_dim = self.go_fingerprints.size(1)
+            neighbor_go_fp = torch.zeros(n_qry, K, go_dim, device=device)
+        else:
+            neighbor_go_fp = None
+
+        if not prot_parts:
+            return (
+                neighbor_protein,
+                neighbor_drug,
+                neighbor_affinity,
+                neighbor_ppr,
+                neighbor_trust,
+                neighbor_mask,
+                matched_counts,
+                neighbor_go_fp,
+            )
+
+        pool_protein = torch.cat(prot_parts, dim=0)
+        pool_drug = torch.cat(drug_parts, dim=0).to(device)
+        pool_affinity = torch.cat(aff_parts, dim=0).squeeze(-1)
+        pool_ppr = torch.cat(ppr_parts, dim=0)
+        pool_trust = torch.cat(trust_parts, dim=0)
+        pool_didx = torch.cat(didx_parts, dim=0)
+        pool_go_fp = torch.cat(go_fp_parts, dim=0) if go_fp_parts else None
+
+        for q_pos, q_idx in enumerate(query_drug_indices.tolist()):
+            match = pool_didx == int(q_idx)
+            if not match.any():
+                continue
+
+            matched_idx = torch.nonzero(match, as_tuple=False).squeeze(-1)
+            scores = pool_ppr[matched_idx] * pool_trust[matched_idx].clamp(min=1e-8)
+            take = min(K, matched_idx.numel())
+            top_idx = torch.topk(scores, k=take, largest=True).indices
+            chosen = matched_idx[top_idx]
+
+            neighbor_protein[q_pos, :take] = pool_protein[chosen]
+            neighbor_drug[q_pos, :take] = pool_drug[chosen]
+            neighbor_affinity[q_pos, :take] = pool_affinity[chosen]
+            neighbor_ppr[q_pos, :take] = pool_ppr[chosen]
+            neighbor_trust[q_pos, :take] = pool_trust[chosen]
+            neighbor_mask[q_pos, :take] = True
+            matched_counts[q_pos] = matched_idx.numel()
+            if neighbor_go_fp is not None and pool_go_fp is not None:
+                neighbor_go_fp[q_pos, :take] = pool_go_fp[chosen]
+
+        return (
+            neighbor_protein,
+            neighbor_drug,
+            neighbor_affinity,
+            neighbor_ppr,
+            neighbor_trust,
+            neighbor_mask,
+            matched_counts,
+            neighbor_go_fp,
+        )
+
 
 if __name__ == "__main__":
     drug_features = torch.randn(1000, 512)

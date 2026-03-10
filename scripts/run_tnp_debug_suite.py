@@ -69,6 +69,7 @@ def main():
     configs = [
         ("global_mean_floor", ["--model-kind", "global-mean", "--strict-baseline"]),
         ("binding_only", ["--model-kind", "binding-only", "--strict-baseline"]),
+        ("neighbor_transfer", ["--model-kind", "neighbor-transfer", "--strict-baseline", "--neighbor-k", "8"]),
         ("tnp_strict", ["--model-kind", "tnp", "--strict-baseline"]),
     ]
     if args.include_incremental:

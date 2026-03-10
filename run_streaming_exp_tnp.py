@@ -23,6 +23,7 @@ from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.diverse_replay_buffer import DiverseReplayBuffer
 from src.data.multiplex_loader import MultiplexPillarSampler
+from src.models.neighbor_transfer import NeighborTransferModel
 from src.models.tnp import BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
 from src.training.cold_start_metrics import classify_regime, summarize_cold_start
@@ -111,7 +112,11 @@ def build_arg_parser():
     parser.add_argument("--max-context", type=int, default=256)
     parser.add_argument("--replay-weight", type=float, default=0.5)
     parser.add_argument("--merge-reduce", choices=["amax", "mean"], default="amax")
-    parser.add_argument("--model-kind", choices=["tnp", "binding-only", "global-mean"], default="tnp")
+    parser.add_argument(
+        "--model-kind",
+        choices=["tnp", "binding-only", "global-mean", "neighbor-transfer"],
+        default="tnp",
+    )
     parser.add_argument("--history-mode", choices=["empty", "full"], default="empty")
     parser.add_argument("--strict-baseline", action="store_true", help="Force the minimal strict-debug configuration")
     parser.add_argument("--cold-start-only", action="store_true", help="Evaluation-only mode; skip parameter updates")
@@ -127,6 +132,7 @@ def build_arg_parser():
     parser.add_argument("--unfreeze-after", type=int, default=None, help="Episode index at which TNP switches from head-only to full")
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
     parser.add_argument("--binding-warmstart", default=None, help="Optional binding-encoder checkpoint")
+    parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
     return parser
 
 
@@ -142,13 +148,17 @@ def apply_presets(args):
         args.per_query_k = 0
         args.gnn_mode = "off"
 
-    if args.model_kind != "tnp" and args.gnn_mode != "off":
+    if args.model_kind not in {"tnp"} and args.gnn_mode != "off":
         print(f"Ignoring gnn_mode={args.gnn_mode} for model_kind={args.model_kind}")
         args.gnn_mode = "off"
 
     if args.model_kind != "tnp" and args.train_scope != "full":
         print(f"Ignoring train_scope={args.train_scope} for model_kind={args.model_kind}")
         args.train_scope = "full"
+
+    if args.model_kind != "tnp" and args.per_query_k != 0:
+        print(f"Ignoring per_query_k={args.per_query_k} for model_kind={args.model_kind}")
+        args.per_query_k = 0
 
     return args
 
@@ -159,6 +169,8 @@ def default_run_name(args):
         parts.append("strict")
     if args.per_query_k > 0:
         parts.append(f"pq{args.per_query_k}")
+    if args.model_kind == "neighbor-transfer":
+        parts.append(f"nk{args.neighbor_k}")
     if args.enable_synthetic_prior:
         parts.append("syn")
     if args.use_go:
@@ -265,6 +277,8 @@ def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
         model = GlobalMeanAffinityModel()
     elif args.model_kind == "binding-only":
         model = BindingOnlyAffinityModel(prot_dim, drug_dim)
+    elif args.model_kind == "neighbor-transfer":
+        model = NeighborTransferModel(prot_dim, drug_dim, go_fp_dim=go_fp_dim)
     else:
         model = ProteinLigandTNP(
             prot_dim,
@@ -335,7 +349,32 @@ def run_episode(
     if builder.go_fingerprints is not None:
         qry_go_fp = builder.go_fingerprints[target_idx].unsqueeze(0).expand(n_qry, -1)
 
-    if args.per_query_k > 0:
+    if args.model_kind == "neighbor-transfer":
+        (
+            nt_neighbor_protein,
+            nt_neighbor_drug,
+            nt_neighbor_affinity,
+            nt_neighbor_ppr,
+            nt_neighbor_trust,
+            nt_neighbor_mask,
+            nt_matched_counts,
+            nt_neighbor_go_fp,
+        ) = builder.build_neighbor_transfer_context(pillar, query_drug_indices, top_k=args.neighbor_k)
+        mu, sigma = model(
+            nt_neighbor_protein,
+            nt_neighbor_drug,
+            nt_neighbor_affinity,
+            nt_neighbor_ppr,
+            nt_neighbor_trust,
+            nt_neighbor_mask,
+            qry_protein,
+            qry_drug,
+            qry_go_fp=qry_go_fp,
+            neighbor_go_fp=nt_neighbor_go_fp,
+            global_mean_affinity=global_mean_affinity,
+        )
+        n_ctx = int(round(nt_matched_counts.float().mean().item()))
+    elif args.per_query_k > 0:
         pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp = builder.build_per_query_context(
             pillar, query_drug_indices, args.per_query_k
         )
@@ -458,6 +497,7 @@ def main():
     print(f"  drug analogs:    {args.drug_analogs}")
     print(f"  GO fingerprints: {args.use_go} (dim={go_fp_dim})")
     print(f"  per-query-k:     {args.per_query_k} {'(dynamic context)' if args.per_query_k > 0 else '(shared context)'}")
+    print(f"  neighbor-k:      {args.neighbor_k}")
     print(f"  cold-start only: {args.cold_start_only}")
     print("-" * 72)
 

@@ -7,6 +7,7 @@ from diagnostic_attention import run_diagnostic
 from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.multiplex_loader import MultiplexPillarSampler
+from src.models.neighbor_transfer import NeighborTransferModel
 from src.training.cold_start_metrics import classify_regime
 
 
@@ -140,6 +141,57 @@ class StrictPrequentialTests(unittest.TestCase):
     def test_attention_overfit_sanity_check(self):
         summary = run_diagnostic(n_steps=500, verbose=False)
         self.assertGreaterEqual(summary["final_ci"], 0.95)
+
+    def test_neighbor_transfer_context_matches_exact_drugs(self):
+        data = make_test_graph()
+        loader = MultiplexPillarSampler(data, history_mode="empty")
+        edge_index = data["protein", "binds_pic50", "drug"].edge_index
+        edge_label = data["protein", "binds_pic50", "drug"].edge_label
+
+        mask0 = edge_index[0] == 0
+        mask1 = edge_index[0] == 1
+        loader.add_revealed_edges(edge_index[:, mask0], edge_label[mask0])
+        loader.add_revealed_edges(edge_index[:, mask1], edge_label[mask1])
+
+        builder = TNPContextBuilder(data["drug"].x)
+        pillar = loader.get_pillar_context(2)
+        (
+            neighbor_protein,
+            neighbor_drug,
+            neighbor_affinity,
+            neighbor_ppr,
+            neighbor_trust,
+            neighbor_mask,
+            matched_counts,
+            neighbor_go_fp,
+        ) = builder.build_neighbor_transfer_context(pillar, torch.tensor([4, 11]), top_k=2)
+
+        self.assertEqual(neighbor_protein.shape, (2, 2, 3))
+        self.assertEqual(neighbor_drug.shape, (2, 2, 3))
+        self.assertTrue(neighbor_mask[0, 0].item())
+        self.assertEqual(float(neighbor_affinity[0, 0]), 5.5)
+        self.assertEqual(int(matched_counts[0]), 1)
+        self.assertEqual(int(matched_counts[1]), 0)
+        self.assertFalse(neighbor_mask[1].any().item())
+        self.assertIsNone(neighbor_go_fp)
+        self.assertEqual(float(neighbor_ppr[0, 0]), 1.0)
+        self.assertEqual(float(neighbor_trust[0, 0]), 1.0)
+
+    def test_neighbor_transfer_model_falls_back_without_neighbors(self):
+        model = NeighborTransferModel(protein_dim=3, drug_dim=2, go_fp_dim=0, hidden_dim=32)
+        mu, sigma = model(
+            neighbor_protein=torch.zeros(2, 2, 3),
+            neighbor_drug=torch.zeros(2, 2, 2),
+            neighbor_affinity=torch.zeros(2, 2),
+            neighbor_ppr=torch.zeros(2, 2),
+            neighbor_trust=torch.zeros(2, 2),
+            neighbor_mask=torch.zeros(2, 2, dtype=torch.bool),
+            qry_protein=torch.randn(2, 3),
+            qry_drug=torch.randn(2, 2),
+            global_mean_affinity=6.5,
+        )
+        self.assertTrue(torch.allclose(mu, torch.full((2,), 6.5)))
+        self.assertTrue(torch.all(sigma > 0))
 
 
 if __name__ == "__main__":
