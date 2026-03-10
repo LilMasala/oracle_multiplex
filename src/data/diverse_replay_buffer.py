@@ -45,8 +45,8 @@ class DiverseReplayBuffer:
         # Seeded separately so it doesn't affect the main training PRNG.
         gen = torch.Generator()
         gen.manual_seed(1337)
-        self.proj = torch.randn(protein_dim, sketch_dim, generator=gen, device=device)
-        self.proj = self.proj / (protein_dim ** 0.5)   # keep scale reasonable
+        self.proj = torch.randn(protein_dim, sketch_dim, generator=gen) / (protein_dim ** 0.5)
+        self.proj = self.proj.to(device)
 
         self._indices: list[int]        = []   # protein_idx for each slot
         self._sketches: list[torch.Tensor] = [] # [sketch_dim] cpu tensors
