@@ -49,12 +49,15 @@ def build_static_obs(data, loader, device):
 
 
 def compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim):
-    """Fit PCA on raw static obs [N, 2*protein_dim+4] → keep top pca_dim components."""
+    """Fit whitened PCA on raw static obs [N, 2*protein_dim+4] → [N, pca_dim] unit-variance."""
     raw = torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1).float()  # [N, D]
     mean = raw.mean(dim=0)
     centered = raw - mean
-    _, _, V = torch.pca_lowrank(centered, q=pca_dim, niter=4)  # V: [D, pca_dim]
-    components = V.T.contiguous()  # [pca_dim, D]
+    _, S, V = torch.pca_lowrank(centered, q=pca_dim, niter=4)  # S: [pca_dim], V: [D, pca_dim]
+    # Whiten: divide each PC by its std so projected features have unit variance.
+    # std of projection = S / sqrt(N - 1)
+    std = S / (raw.size(0) - 1) ** 0.5  # [pca_dim]
+    components = (V / std.unsqueeze(0)).T.contiguous()  # [pca_dim, D]  (whitened)
     return mean.cpu(), components.cpu()
 
 
