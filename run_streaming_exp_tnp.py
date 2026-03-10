@@ -107,12 +107,9 @@ def main():
     os.makedirs("models", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    # Reset loader buffer (prequential: start with no known bindings)
-    loader.binds_ei = torch.empty((2, 0), dtype=torch.long, device=device)
-    loader.binds_y = torch.empty((0,), dtype=torch.float, device=device)
-    loader.binds_w = torch.empty((0,), dtype=torch.float, device=device)
-    loader.edge_birth_t = torch.empty((0,), dtype=torch.float, device=device)
-    loader._refresh_bind_sorted_index()
+    # Keep full dataset binding edges as prior context (ChEMBL/PubChem historical knowledge).
+    # Prequential constraint is on the *current* protein only: evaluate before revealing its labels.
+    # episode_log will still measure zero-shot ranking performance on each protein.
 
     episode_log = []
 
