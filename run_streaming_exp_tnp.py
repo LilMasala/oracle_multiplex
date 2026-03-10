@@ -209,6 +209,14 @@ def main():
         gnn_emb_dim=gnn_emb_dim,
     ).to(device)
 
+    # Fix Bug 1: output head mu-bias initialized to 0 → model predicts ~0 while
+    # all affinities are pIC50 5–9.  The initial absolute error (~7.5) is 1000×
+    # larger than any drug-specific signal, so the first gradient step collapses
+    # all mu predictions to the same value and they never diverge again (CI = 0.5).
+    # Seeding the bias at the global mean affinity reduces the initial error to ~1
+    # and lets drug-specific gradients compete from step 1.
+    model.output_head[-1].bias.data[0] = global_mean_affinity
+
     loss_fn   = TNPLoss().to(device)
     all_params = list(model.parameters()) + list(loss_fn.parameters())
     if protein_gnn is not None:
