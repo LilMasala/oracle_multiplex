@@ -26,7 +26,6 @@ class GraphBiasedMHA(nn.Module):
         assert token_dim % nhead == 0
         self.nhead    = nhead
         self.head_dim = token_dim // nhead
-        self.scale    = self.head_dim ** -0.5
         self.dropout  = dropout
 
         self.in_proj  = nn.Linear(token_dim, 3 * token_dim, bias=True)
@@ -50,33 +49,38 @@ class GraphBiasedMHA(nn.Module):
         qkv = self.in_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q = q.view(B, N, H, d).transpose(1, 2)  # [1, H, N, d]
+        q = q.view(B, N, H, d).transpose(1, 2)  # [B, H, N, d]
         k = k.view(B, N, H, d).transpose(1, 2)
         v = v.view(B, N, H, d).transpose(1, 2)
 
-        # V gate for context tokens
+        # V gate for context tokens (applied before SDPA, no change needed)
         if n_ctx > 0:
             gate = torch.sigmoid(self.trust_scale * ctx_trust)  # [n_ctx]
             ones = torch.ones(N - n_ctx, device=x.device)
             gate_full = torch.cat([gate, ones], dim=0)           # [N]
             v = v * gate_full.view(1, 1, N, 1)
 
-        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [1, H, N, N]
+        # Build combined additive bias: PPR column logit bonus + block mask.
+        # Float attn_bias lets PyTorch pick the most efficient SDPA kernel
+        # (xformers mem_efficient_attention on H100 supports arbitrary float bias).
+        # When n_ctx==0 and no block mask we pass None → pure FlashAttention.
+        bias = None
+        if n_ctx > 0 or attn_mask is not None:
+            bias = torch.zeros(1, 1, N, N, device=x.device, dtype=x.dtype)
+            if n_ctx > 0:
+                col_bias = -self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))
+                pad = torch.zeros(N - n_ctx, device=x.device)
+                col_bias_full = torch.cat([col_bias, pad], dim=0)       # [N]
+                bias = bias + col_bias_full.view(1, 1, 1, N)
+            if attn_mask is not None:
+                bias = bias.masked_fill(attn_mask.view(1, 1, N, N), float("-inf"))
 
-        # Graph bias on context columns
-        if n_ctx > 0:
-            col_bias = -self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))
-            pad = torch.zeros(N - n_ctx, device=x.device)
-            col_bias_full = torch.cat([col_bias, pad], dim=0)
-            logits = logits + col_bias_full.view(1, 1, 1, N)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=bias,
+            dropout_p=self.dropout if self.training else 0.0,
+        )  # [B, H, N, d]
 
-        if attn_mask is not None:
-            logits = logits.masked_fill(attn_mask.view(1, 1, N, N), float("-inf"))
-
-        weights = F.softmax(logits, dim=-1)
-        weights = F.dropout(weights, p=self.dropout, training=self.training)
-
-        out = torch.matmul(weights, v)                         # [1, H, N, d]
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out_proj(out)
 
