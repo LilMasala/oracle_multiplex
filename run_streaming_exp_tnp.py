@@ -17,6 +17,7 @@ from torch.optim import Adam
 
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.data.context_builder import TNPContextBuilder
+from src.data.diverse_replay_buffer import DiverseReplayBuffer
 from src.protocol.prequential import build_multiplex_stream
 from src.models.tnp import ProteinLigandTNP
 from src.training.tnp_loss import TNPLoss
@@ -43,19 +44,11 @@ def create_pactivity_edges(data):
 
 
 def sample_replay_batch(
-    loader, current_protein_idx, replay_edges_per_protein=256, max_replay_proteins=1
+    loader, replay_protein_indices, replay_edges_per_protein=256
 ):
-    if loader.binds_ei.size(1) == 0:
-        return []
-    hist_proteins = torch.unique(loader.binds_ei[0])
-    hist_proteins = hist_proteins[hist_proteins != int(current_protein_idx)]
-    if hist_proteins.numel() == 0:
-        return []
-    n_select = min(max_replay_proteins, hist_proteins.numel())
-    perm = torch.randperm(hist_proteins.numel(), device=hist_proteins.device)[:n_select]
-    replay_proteins = hist_proteins[perm]
-    replay_batches  = []
-    for replay_protein_idx in replay_proteins.tolist():
+    """Fetch replay batches for the given protein indices from the loader history."""
+    replay_batches = []
+    for replay_protein_idx in replay_protein_indices:
         mask     = loader.binds_ei[0] == replay_protein_idx
         edge_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
         if edge_idx.numel() == 0:
@@ -156,6 +149,7 @@ def main():
     loader   = MultiplexPillarSampler(data, binds_metric="binds_activity",
                                       priors_cache_path=args.priors,
                                       temporal_decay=0.0)
+    replay_buffer = DiverseReplayBuffer(max_size=1000, protein_dim=prot_dim, device=device)
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
     if args.n_episodes is not None:
         episodes = episodes[:args.n_episodes]
@@ -289,11 +283,11 @@ def main():
             w_listnet  = float(train_result["w_listnet"])
             w_lambda   = float(train_result["w_lambda"])
 
-            # Experience replay
+            # Experience replay — diverse coreset sampling
+            replay_protein_indices = replay_buffer.sample(25)
             replay_batches = sample_replay_batch(
-                loader, ep.protein_idx,
+                loader, replay_protein_indices,
                 replay_edges_per_protein=256,
-                max_replay_proteins=25,
             )
             if replay_batches:
                 replay_total = torch.tensor(0.0, device=device)
@@ -308,7 +302,9 @@ def main():
                 (args.replay_weight * replay_total).backward()
                 replay_loss_val = float(replay_total.detach())
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(loss_fn.parameters()), 1.0
+            )
             optimizer.step()
 
             # Unit 6: refresh GNN embeddings periodically
@@ -324,6 +320,7 @@ def main():
                 builder.gnn_protein_embs = gnn_all_embs
 
         loader.add_revealed_edges(ep.edges, ep.labels)
+        replay_buffer.add(ep.protein_idx, pillar["target_features"])
 
         if i % 50 == 0 and i > 0:
             torch.save(model.state_dict(), f"models/tnp_checkpoint_ep{i:04d}.pt")

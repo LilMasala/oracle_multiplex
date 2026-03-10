@@ -64,7 +64,7 @@ class GraphBiasedMHA(nn.Module):
 
         # Graph bias on context columns
         if n_ctx > 0:
-            col_bias = self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))
+            col_bias = -self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))
             pad = torch.zeros(N - n_ctx, device=x.device)
             col_bias_full = torch.cat([col_bias, pad], dim=0)
             logits = logits + col_bias_full.view(1, 1, 1, N)
