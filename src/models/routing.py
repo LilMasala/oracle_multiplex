@@ -122,7 +122,7 @@ class BayesianMultiplexRouter(PyroModule):
         top_k=2,
         obs_scale=1.0,
         alpha_prior_shape=1.0,
-        alpha_prior_rate=1.0,
+        alpha_prior_rate=0.01,  # diffuse: E[alpha]=100, lets data decide cluster count
         dpmm_init=None,
     ):
         super().__init__()

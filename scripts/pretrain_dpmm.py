@@ -58,6 +58,18 @@ def compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim):
     return mean.cpu(), components.cpu()
 
 
+def kmeans_pp_init(obs, K):
+    """K-means++ centroid seeding — spreads initial centroids across the data."""
+    N = obs.size(0)
+    chosen = [torch.randint(N, (1,)).item()]
+    for _ in range(K - 1):
+        dists = torch.cdist(obs, obs[chosen]).min(dim=1).values  # [N] min dist to any chosen
+        probs = dists ** 2
+        probs = probs / probs.sum()
+        chosen.append(torch.multinomial(probs, 1).item())
+    return obs[chosen].clone()  # [K, D]
+
+
 def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=2000, lr=1e-3, device="cpu", pca_dim=256, warmup_steps=None):
     protein_dim = z_t.size(1)
     warmup_steps = warmup_steps if warmup_steps is not None else max(1, n_steps // 10)
@@ -65,13 +77,20 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
     print(f"  Computing PCA: {2 * protein_dim + 4}D → {pca_dim}D ...")
     pca_mean, pca_components = compute_pca(z_t, ppr_centroid, static_trust_4, pca_dim)
 
+    # K-means++ centroid init in PCA space — breaks all-zeros symmetry without fixing K.
+    print(f"  K-means++ seeding {max_experts} centroids ...")
+    with torch.no_grad():
+        raw = torch.cat([z_t, ppr_centroid, static_trust_4], dim=-1).float()
+        projected = (raw - pca_mean.to(device)) @ pca_components.T.to(device)  # [N, pca_dim]
+    init_centroids = kmeans_pp_init(projected, max_experts).cpu()
+
     pyro.clear_param_store()
     # drug_dim=1 is a placeholder; it's only used by router_net / forward(), not model/guide obs.
     router = BayesianMultiplexRouter(
         protein_dim=protein_dim,
         drug_dim=1,
         max_experts=max_experts,
-        dpmm_init={"pca_mean": pca_mean, "pca_components": pca_components},
+        dpmm_init={"pca_mean": pca_mean, "pca_components": pca_components, "centroids": init_centroids},
     ).to(device)
 
     def make_scheduler(optim):
@@ -100,7 +119,8 @@ def pretrain_dpmm(z_t, ppr_centroid, static_trust_4, max_experts=16, n_steps=200
         scheduler.step()
         if step % 200 == 0:
             current_lr = next(iter(scheduler.optim_objs.values())).optimizer.param_groups[0]["lr"]
-            print(f"  step {step:4d}  ELBO loss: {loss:.4f}  lr: {current_lr:.2e}")
+            q_alpha = (router.q_alpha_shape / router.q_alpha_rate).item()
+            print(f"  step {step:4d}  ELBO loss: {loss:.4f}  lr: {current_lr:.2e}  q(alpha): {q_alpha:.2f}")
 
     centroids = router.component_loc.detach().cpu()  # [K, static_obs_dim]
     q_beta_a = router.q_beta_a.detach().cpu()        # [K-1]
