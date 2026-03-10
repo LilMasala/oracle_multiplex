@@ -25,6 +25,30 @@ from src.training.metrics import calculate_ci, calculate_ef_at_k
 from src.training.cold_start_metrics import classify_regime, summarize_cold_start
 
 
+def precompute_go_fingerprints(data):
+    """
+    Unit 9: Mean-pool anc2vec GO embeddings per protein.
+    Returns [N_proteins, go_dim] tensor, or None if GO data unavailable.
+    """
+    edge_key = ("protein", "relates", "go")
+    if "go" not in data.node_types or edge_key not in data.edge_types:
+        return None
+    go_x    = data["go"].x                                      # [N_go, go_dim]
+    ei      = data[edge_key].edge_index                         # [2, N_edges]
+    prot_idx, go_idx = ei[0], ei[1]
+    N_p, go_dim = data["protein"].x.size(0), go_x.size(1)
+    device  = data["protein"].x.device
+    go_fp   = torch.zeros(N_p, go_dim, device=device)
+    count   = torch.zeros(N_p, device=device)
+    go_fp.index_add_(0, prot_idx, go_x[go_idx].to(device))
+    count.index_add_(0, prot_idx, torch.ones(prot_idx.size(0), device=device))
+    count   = count.clamp(min=1.0)
+    go_fp   = go_fp / count.unsqueeze(1)
+    n_annotated = int((count > 1).sum())
+    print(f"  GO fingerprints: {n_annotated}/{N_p} proteins annotated (dim={go_dim})")
+    return go_fp
+
+
 def create_pactivity_edges(data):
     ei_list, y_list = [], []
     for m in ["binds_pic50", "binds_pki", "binds_pkd"]:
@@ -83,20 +107,28 @@ def run_episode(model, builder, drug_features, pillar, query_drug_indices,
         target_idx  = int(pillar["target_idx"])
         qry_gnn_emb = gnn_all_embs[target_idx].unsqueeze(0).expand(n_q, -1)
 
+    # Unit 9: GO fingerprint for the target protein
+    qry_go_fp = None
+    if builder.go_fingerprints is not None:
+        target_idx = int(pillar["target_idx"])
+        qry_go_fp  = builder.go_fingerprints[target_idx].unsqueeze(0).expand(n_q, -1)
+
     if per_query_k > 0:
         # Unit 8: per-query dynamic context
-        pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean = \
+        pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp = \
             builder.build_per_query_context(pillar, query_drug_indices, per_query_k)
         return model.forward_per_query(
             pq_p, pq_d, pq_a, pq_ppr, pq_trust,
             qry_protein, qry_drug, pq_aff_mean,
             pq_gnn_emb=pq_gnn,
             qry_gnn_emb=qry_gnn_emb,
+            pq_go_fp=pq_go_fp,
+            qry_go_fp=qry_go_fp,
             ppr_centroid=ppr_centroid,
         )
 
     # Shared context path (default)
-    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn = builder.build_context(
+    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn, ctx_go_fp = builder.build_context(
         pillar, query_drug_indices
     )
     return model(
@@ -106,6 +138,8 @@ def run_episode(model, builder, drug_features, pillar, query_drug_indices,
         ppr_centroid=ppr_centroid,
         ctx_gnn_emb=ctx_gnn,
         qry_gnn_emb=qry_gnn_emb,
+        ctx_go_fp=ctx_go_fp,
+        qry_go_fp=qry_go_fp,
         global_mean_affinity=global_mean_affinity,
     )
 
@@ -134,6 +168,10 @@ def main():
                         help="Enable drug analog context injection (Unit 5)")
     parser.add_argument("--analog-top-k", type=int, default=32,
                         help="Top-K analogues per drug (Unit 5)")
+
+    # Unit 9: GO functional fingerprints (anc2vec mean-pool)
+    parser.add_argument("--use-go", action="store_true",
+                        help="Inject GO anc2vec fingerprints into protein encoder (Unit 9)")
 
     # Unit 8: per-query dynamic context
     parser.add_argument("--per-query-k", type=int, default=0,
@@ -202,6 +240,14 @@ def main():
         )
         print(f"GNN embeddings: {gnn_all_embs.shape}")
 
+    # --- Unit 9: GO fingerprints ---
+    go_fingerprints = None
+    go_fp_dim       = 0
+    if args.use_go:
+        go_fingerprints = precompute_go_fingerprints(data)
+        if go_fingerprints is not None:
+            go_fp_dim = go_fingerprints.size(1)
+
     # --- Build context builder ---
     builder = TNPContextBuilder(
         drug_features,
@@ -212,12 +258,14 @@ def main():
         drug_analog_index=drug_analog_index,
         gnn_protein_embs=gnn_all_embs,
     )
+    builder.go_fingerprints = go_fingerprints
 
     # --- Build model ---
     model = ProteinLigandTNP(
         prot_dim, drug_dim,
         token_dim=args.token_dim,
         gnn_emb_dim=gnn_emb_dim,
+        go_fp_dim=go_fp_dim,
     ).to(device)
 
 
@@ -238,6 +286,7 @@ def main():
     print(f"  GNN pre-encoder: {args.use_gnn}")
     print(f"  cold-start only: {args.cold_start_only}")
     print(f"  per-query-k:     {args.per_query_k} {'(Unit 8 enabled)' if args.per_query_k > 0 else '(shared context)'}")
+    print(f"  GO fingerprints: {args.use_go} (dim={go_fp_dim})")
     print("-" * 70)
 
     os.makedirs("models",   exist_ok=True)

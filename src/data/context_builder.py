@@ -44,6 +44,9 @@ class TNPContextBuilder:
         # Unit 6
         self.gnn_protein_embs = gnn_protein_embs
 
+        # Unit 9: GO functional fingerprints [N_proteins, go_fp_dim] or None
+        self.go_fingerprints: Optional[torch.Tensor] = None
+
     def _collect_layer(
         self,
         neighbor_indices: torch.Tensor,
@@ -80,7 +83,7 @@ class TNPContextBuilder:
         drug_idx, prot_idx = drug_idx[valid], prot_idx[valid]
 
         prot_list, drug_list, aff_list = [], [], []
-        ppr_list, trust_list, didx_list, gnn_list = [], [], [], []
+        ppr_list, trust_list, didx_list, gnn_list, go_fp_list = [], [], [], [], []
 
         for k, nidx in enumerate(neighbor_indices.tolist()):
             mask = prot_idx == nidx
@@ -101,7 +104,12 @@ class TNPContextBuilder:
                 gnn_emb = self.gnn_protein_embs[nidx].unsqueeze(0).expand(n_edges, -1)
                 gnn_list.append(gnn_emb)
 
-        return prot_list, drug_list, aff_list, ppr_list, trust_list, didx_list, gnn_list
+            # Unit 9: GO fingerprints aligned with context tokens
+            if self.go_fingerprints is not None:
+                go_emb = self.go_fingerprints[nidx].unsqueeze(0).expand(n_edges, -1)
+                go_fp_list.append(go_emb)
+
+        return prot_list, drug_list, aff_list, ppr_list, trust_list, didx_list, gnn_list, go_fp_list
 
     def _inject_drug_analogs(
         self,
@@ -184,6 +192,7 @@ class TNPContextBuilder:
         prot_parts, drug_parts, aff_parts = [], [], []
         ppr_parts, trust_parts, didx_parts, gnn_parts = [], [], [], []
 
+        go_fp_parts = []
         for layer in ("form", "role"):
             neighbors = pillar[f"{layer}_neighbors"]
             features  = pillar[f"{layer}_features"]
@@ -191,7 +200,7 @@ class TNPContextBuilder:
             ei        = pillar[f"{layer}_binds_ei"]
             y         = pillar[f"{layer}_binds_y"]
             w         = pillar[f"{layer}_binds_w"]
-            p, d, a, ppr, trust, didx, gnn = self._collect_layer(
+            p, d, a, ppr, trust, didx, gnn, go_fp = self._collect_layer(
                 neighbors, features, diff_w, ei, y, w
             )
             prot_parts.extend(p)
@@ -201,6 +210,7 @@ class TNPContextBuilder:
             trust_parts.extend(trust)
             didx_parts.extend(didx)
             gnn_parts.extend(gnn)
+            go_fp_parts.extend(go_fp)
 
         # Unit 5: Drug analog injection (only when sparse but not cold)
         if (
@@ -243,7 +253,7 @@ class TNPContextBuilder:
                 syn_gnn      = None
                 if self.gnn_protein_embs is not None:
                     syn_gnn = self.gnn_protein_embs.mean(0, keepdim=True).to(device)
-                return syn_protein, syn_drug, syn_affinity, syn_ppr, syn_trust, syn_gnn
+                return syn_protein, syn_drug, syn_affinity, syn_ppr, syn_trust, syn_gnn, None
 
             return (
                 torch.zeros(0, protein_dim, device=device),
@@ -252,6 +262,7 @@ class TNPContextBuilder:
                 torch.zeros(0, device=device),
                 torch.zeros(0, device=device),
                 None,
+                None,
             )
 
         ctx_protein  = torch.cat(prot_parts, dim=0)
@@ -259,7 +270,8 @@ class TNPContextBuilder:
         ctx_affinity = torch.cat(aff_parts,  dim=0)
         ctx_ppr      = torch.cat(ppr_parts,  dim=0)
         ctx_trust    = torch.cat(trust_parts, dim=0)
-        ctx_gnn_emb  = torch.cat(gnn_parts, dim=0) if gnn_parts else None
+        ctx_gnn_emb  = torch.cat(gnn_parts,   dim=0) if gnn_parts   else None
+        ctx_go_fp    = torch.cat(go_fp_parts, dim=0) if go_fp_parts else None
 
         N = ctx_protein.size(0)
         if N > self.max_context:
@@ -272,8 +284,10 @@ class TNPContextBuilder:
             ctx_trust    = ctx_trust[idx]
             if ctx_gnn_emb is not None:
                 ctx_gnn_emb = ctx_gnn_emb[idx]
+            if ctx_go_fp is not None:
+                ctx_go_fp = ctx_go_fp[idx]
 
-        return ctx_protein, ctx_drug, ctx_affinity, ctx_ppr, ctx_trust, ctx_gnn_emb
+        return ctx_protein, ctx_drug, ctx_affinity, ctx_ppr, ctx_trust, ctx_gnn_emb, ctx_go_fp
 
     def build_per_query_context(
         self,
@@ -307,8 +321,9 @@ class TNPContextBuilder:
         prot_parts, drug_parts, aff_parts = [], [], []
         ppr_parts, trust_parts, gnn_parts = [], [], []
 
+        go_fp_parts = []
         for layer in ("form", "role"):
-            p, d, a, ppr, trust, _, gnn = self._collect_layer(
+            p, d, a, ppr, trust, _, gnn, go_fp = self._collect_layer(
                 pillar[f"{layer}_neighbors"],
                 pillar[f"{layer}_features"],
                 pillar[f"{layer}_diff_w"],
@@ -317,7 +332,8 @@ class TNPContextBuilder:
                 pillar[f"{layer}_binds_w"],
             )
             prot_parts.extend(p); drug_parts.extend(d); aff_parts.extend(a)
-            ppr_parts.extend(ppr); trust_parts.extend(trust); gnn_parts.extend(gnn)
+            ppr_parts.extend(ppr); trust_parts.extend(trust)
+            gnn_parts.extend(gnn); go_fp_parts.extend(go_fp)
 
         if not prot_parts:
             # Cold-start: return zero context, anchor to global mean
@@ -332,12 +348,13 @@ class TNPContextBuilder:
                 torch.full((N_qry,), self.global_mean_affinity, device=device),
             )
 
-        pool_protein  = torch.cat(prot_parts, dim=0)
-        pool_drug     = torch.cat(drug_parts, dim=0).to(device)
-        pool_affinity = torch.cat(aff_parts,  dim=0)
-        pool_ppr      = torch.cat(ppr_parts,  dim=0)
+        pool_protein  = torch.cat(prot_parts,  dim=0)
+        pool_drug     = torch.cat(drug_parts,  dim=0).to(device)
+        pool_affinity = torch.cat(aff_parts,   dim=0)
+        pool_ppr      = torch.cat(ppr_parts,   dim=0)
         pool_trust    = torch.cat(trust_parts, dim=0)
-        pool_gnn      = torch.cat(gnn_parts,  dim=0) if gnn_parts else None
+        pool_gnn      = torch.cat(gnn_parts,   dim=0) if gnn_parts   else None
+        pool_go_fp    = torch.cat(go_fp_parts, dim=0) if go_fp_parts else None
 
         # Subsample pool if huge (PPR-weighted to keep best candidates)
         P = pool_protein.size(0)
@@ -348,8 +365,8 @@ class TNPContextBuilder:
             pool_affinity = pool_affinity[idx]
             pool_ppr      = pool_ppr[idx]
             pool_trust    = pool_trust[idx]
-            if pool_gnn is not None:
-                pool_gnn = pool_gnn[idx]
+            if pool_gnn   is not None: pool_gnn   = pool_gnn[idx]
+            if pool_go_fp is not None: pool_go_fp = pool_go_fp[idx]
             P = max_pool
 
         # 2. Score: cosine_sim(query_drug, pool_drug) × PPR  →  [N_qry, P]
@@ -369,12 +386,13 @@ class TNPContextBuilder:
         pq_affinity = pool_affinity[topk_idx]                         # [N_qry, K, 1]
         pq_ppr      = pool_ppr[topk_idx]                              # [N_qry, K]
         pq_trust    = pool_trust[topk_idx]                            # [N_qry, K]
-        pq_gnn      = pool_gnn[topk_idx] if pool_gnn is not None else None
+        pq_gnn      = pool_gnn[topk_idx]   if pool_gnn   is not None else None
+        pq_go_fp    = pool_go_fp[topk_idx] if pool_go_fp is not None else None
 
         # Per-query anchor: mean affinity of each drug's own context
         pq_aff_mean = pq_affinity.squeeze(-1).mean(dim=1)             # [N_qry]
 
-        return pq_protein, pq_drug, pq_affinity, pq_ppr, pq_trust, pq_gnn, pq_aff_mean
+        return pq_protein, pq_drug, pq_affinity, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp
 
 
 if __name__ == "__main__":

@@ -169,6 +169,7 @@ class ProteinLigandTNP(nn.Module):
         num_layers: int = 4,
         dropout: float = 0.1,
         gnn_emb_dim: int = 0,   # Unit 6: set > 0 to enable GNN residual
+        go_fp_dim:  int = 0,   # Unit 9: set > 0 to enable GO fingerprint residual
     ):
         super().__init__()
         self.token_dim   = token_dim
@@ -217,6 +218,12 @@ class ProteinLigandTNP(nn.Module):
             self.ctx_gnn_proj = nn.Linear(gnn_emb_dim, token_dim // 2)
             self.qry_gnn_proj = nn.Linear(gnn_emb_dim, token_dim // 2)
 
+        # Unit 9: GO functional fingerprint projections (anc2vec mean-pool)
+        self.go_fp_dim = go_fp_dim
+        if go_fp_dim > 0:
+            self.ctx_go_fp_proj = nn.Linear(go_fp_dim, token_dim // 2)
+            self.qry_go_fp_proj = nn.Linear(go_fp_dim, token_dim // 2)
+
         # Unit 7: Direct binding encoder + projection into token space
         self.binding_encoder = BindingEncoder(protein_dim, drug_dim)
         self.prior_proj = nn.Linear(1, token_dim)
@@ -227,10 +234,13 @@ class ProteinLigandTNP(nn.Module):
         ctx_drug: torch.Tensor,
         ctx_affinity: torch.Tensor,
         ctx_gnn_emb: Optional[torch.Tensor] = None,
+        ctx_go_fp:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         p = self.ctx_protein_proj(ctx_protein)
         if ctx_gnn_emb is not None and self.gnn_emb_dim > 0:
             p = p + self.ctx_gnn_proj(ctx_gnn_emb)   # Unit 6: residual
+        if ctx_go_fp is not None and self.go_fp_dim > 0:
+            p = p + self.ctx_go_fp_proj(ctx_go_fp)   # Unit 9: GO fingerprint residual
         d = self.ctx_drug_proj(ctx_drug)
         a = self.ctx_affinity_proj(ctx_affinity)
         return self.ctx_fusion(torch.cat([p, d, a], dim=-1))
@@ -240,10 +250,13 @@ class ProteinLigandTNP(nn.Module):
         qry_protein: torch.Tensor,
         qry_drug: torch.Tensor,
         qry_gnn_emb: Optional[torch.Tensor] = None,
+        qry_go_fp:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         p = self.qry_protein_proj(qry_protein)
         if qry_gnn_emb is not None and self.gnn_emb_dim > 0:
             p = p + self.qry_gnn_proj(qry_gnn_emb)   # Unit 6: residual
+        if qry_go_fp is not None and self.go_fp_dim > 0:
+            p = p + self.qry_go_fp_proj(qry_go_fp)   # Unit 9: GO fingerprint residual
         d = self.qry_drug_proj(qry_drug)
         return self.qry_fusion(torch.cat([p, d], dim=-1))
 
@@ -273,6 +286,8 @@ class ProteinLigandTNP(nn.Module):
         ppr_centroid: Optional[torch.Tensor] = None,  # Unit 4: [protein_dim]
         ctx_gnn_emb: Optional[torch.Tensor] = None,   # Unit 6: [N_ctx, gnn_dim]
         qry_gnn_emb: Optional[torch.Tensor] = None,   # Unit 6: [N_qry, gnn_dim]
+        ctx_go_fp:  Optional[torch.Tensor] = None,    # Unit 9: [N_ctx, go_fp_dim]
+        qry_go_fp:  Optional[torch.Tensor] = None,    # Unit 9: [N_qry, go_fp_dim]
         global_mean_affinity: float = 6.5,            # fallback for cold-start
     ):
         device = qry_protein.device
@@ -295,7 +310,7 @@ class ProteinLigandTNP(nn.Module):
         binding_prior = self.binding_encoder(qry_protein, qry_drug)  # [N_qry]
 
         # Encode query tokens
-        qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb)
+        qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb, qry_go_fp)
         qry_tokens = qry_tokens + self.type_embed(
             torch.ones(n_qry, dtype=torch.long, device=device)
         )
@@ -309,7 +324,7 @@ class ProteinLigandTNP(nn.Module):
         qry_tokens  = qry_tokens + density_tok       # broadcast over [n_qry, D]
 
         if n_ctx > 0:
-            ctx_tokens = self._encode_context(ctx_protein, ctx_drug, ctx_affinity, ctx_gnn_emb)
+            ctx_tokens = self._encode_context(ctx_protein, ctx_drug, ctx_affinity, ctx_gnn_emb, ctx_go_fp)
             ctx_tokens = ctx_tokens + self.type_embed(
                 torch.zeros(n_ctx, dtype=torch.long, device=device)
             )
@@ -372,6 +387,8 @@ class ProteinLigandTNP(nn.Module):
         pq_aff_mean: torch.Tensor,          # [N_qry]  per-query context affinity mean
         pq_gnn_emb:  Optional[torch.Tensor] = None,  # [N_qry, K, gnn_dim]
         qry_gnn_emb: Optional[torch.Tensor] = None,  # [N_qry, gnn_dim]
+        pq_go_fp:    Optional[torch.Tensor] = None,  # [N_qry, K, go_fp_dim]
+        qry_go_fp:   Optional[torch.Tensor] = None,  # [N_qry, go_fp_dim]
         ppr_centroid: Optional[torch.Tensor] = None,
     ):
         """
@@ -395,19 +412,20 @@ class ProteinLigandTNP(nn.Module):
         binding_prior = self.binding_encoder(qry_protein, qry_drug)   # [N_qry]
 
         # --- Encode context tokens (flatten → encode → reshape) ---
-        pq_p_flat   = pq_protein.reshape(N_qry * K, -1)
-        pq_d_flat   = pq_drug.reshape(N_qry * K, -1)
-        pq_a_flat   = pq_affinity.reshape(N_qry * K, 1)
-        pq_gnn_flat = pq_gnn_emb.reshape(N_qry * K, -1) if pq_gnn_emb is not None else None
+        pq_p_flat    = pq_protein.reshape(N_qry * K, -1)
+        pq_d_flat    = pq_drug.reshape(N_qry * K, -1)
+        pq_a_flat    = pq_affinity.reshape(N_qry * K, 1)
+        pq_gnn_flat  = pq_gnn_emb.reshape(N_qry * K, -1) if pq_gnn_emb is not None else None
+        pq_go_flat   = pq_go_fp.reshape(N_qry * K, -1)   if pq_go_fp  is not None else None
 
-        ctx_tokens = self._encode_context(pq_p_flat, pq_d_flat, pq_a_flat, pq_gnn_flat)
+        ctx_tokens = self._encode_context(pq_p_flat, pq_d_flat, pq_a_flat, pq_gnn_flat, pq_go_flat)
         ctx_tokens = ctx_tokens.view(N_qry, K, -1)                    # [N_qry, K, D]
         ctx_tokens = ctx_tokens + self.type_embed(
             torch.zeros(K, dtype=torch.long, device=device)
         ).unsqueeze(0)                                                 # broadcast over N_qry
 
         # --- Encode query tokens ---
-        qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb)   # [N_qry, D]
+        qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb, qry_go_fp)   # [N_qry, D]
         qry_tokens = qry_tokens + self.type_embed(
             torch.ones(N_qry, dtype=torch.long, device=device)
         )
