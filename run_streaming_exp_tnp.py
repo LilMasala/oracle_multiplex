@@ -90,7 +90,8 @@ def main():
     drug_features = data["drug"].x
 
     loader = MultiplexPillarSampler(data, binds_metric="binds_activity",
-                                    priors_cache_path=args.priors)
+                                    priors_cache_path=args.priors,
+                                    temporal_decay=0.0)
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
     if args.n_episodes is not None:
         episodes = episodes[:args.n_episodes]

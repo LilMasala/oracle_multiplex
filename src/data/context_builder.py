@@ -6,7 +6,7 @@ class TNPContextBuilder:
         self,
         drug_features: torch.Tensor,      # [N_drugs, drug_dim]
         max_context: int = 256,
-        min_affinity_weight: float = 0.1,
+        min_affinity_weight: float = 0.0,
     ):
         self.drug_features = drug_features
         self.max_context = max_context
@@ -116,7 +116,9 @@ class TNPContextBuilder:
 
         N = ctx_protein.size(0)
         if N > self.max_context:
-            idx = torch.randperm(N, device=device)[:self.max_context]
+            # Sample proportional to PPR score — prefer edges from graph-close neighbors
+            weights = ctx_ppr.clamp(min=1e-8)
+            idx = torch.multinomial(weights, self.max_context, replacement=False)
             ctx_protein  = ctx_protein[idx]
             ctx_drug     = ctx_drug[idx]
             ctx_affinity = ctx_affinity[idx]
