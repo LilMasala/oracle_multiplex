@@ -3,6 +3,7 @@ Graph-biased TNP with cold-start improvements:
   Unit 3 — Context density gating (calibrated uncertainty)
   Unit 4 — PPR centroid interpolation in query encoding
   Unit 6 — GNN pre-encoder residual in protein projections
+  Unit 7 — Direct binding encoder (separate learning path for protein-drug features)
 """
 import math
 import torch
@@ -103,6 +104,39 @@ class GraphBiasedTransformerLayer(nn.Module):
         return x
 
 
+class BindingEncoder(nn.Module):
+    """
+    Unit 7: Direct protein-drug binding encoder.
+
+    Learns what raw protein and drug features predict affinity, independent of
+    the transformer's context-aggregation path.  Trained on every revealed
+    (protein, drug, affinity) triple via the same loss as the TNP — but its
+    gradient only flows into this MLP, not back through the transformer (we
+    detach its output before injecting it as a query-token residual).
+
+    At cold-start its output contributes fully to mu; as context grows the
+    contribution is density-gated toward zero so the transformer's
+    neighbor-transfer signal takes over.
+    """
+
+    def __init__(self, protein_dim: int, drug_dim: int, hidden: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(protein_dim + drug_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        # Zero-init last layer so it starts as a no-op
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, protein: torch.Tensor, drug: torch.Tensor) -> torch.Tensor:
+        """Returns [N] affinity residual."""
+        return self.net(torch.cat([protein, drug], dim=-1)).squeeze(-1)
+
+
 class ProteinLigandTNP(nn.Module):
     """
     Graph-biased Transformer Neural Process for protein-ligand binding prediction.
@@ -169,6 +203,10 @@ class ProteinLigandTNP(nn.Module):
         if gnn_emb_dim > 0:
             self.ctx_gnn_proj = nn.Linear(gnn_emb_dim, token_dim // 2)
             self.qry_gnn_proj = nn.Linear(gnn_emb_dim, token_dim // 2)
+
+        # Unit 7: Direct binding encoder + projection into token space
+        self.binding_encoder = BindingEncoder(protein_dim, drug_dim)
+        self.prior_proj = nn.Linear(1, token_dim)
 
     def _encode_context(
         self,
@@ -238,11 +276,19 @@ class ProteinLigandTNP(nn.Module):
             alpha_eff = torch.sigmoid(self.centroid_alpha) * (1.0 - density)
             qry_protein = (1.0 - alpha_eff) * qry_protein + alpha_eff * ppr_centroid.unsqueeze(0)
 
+        # Unit 7: direct binding prior — trained end-to-end via mu, but detached
+        # before injection into query tokens so the transformer's context-reading
+        # gradient is not polluted by the binding encoder's learning signal.
+        binding_prior = self.binding_encoder(qry_protein, qry_drug)  # [N_qry]
+
         # Encode query tokens
         qry_tokens = self._encode_query(qry_protein, qry_drug, qry_gnn_emb)
         qry_tokens = qry_tokens + self.type_embed(
             torch.ones(n_qry, dtype=torch.long, device=device)
         )
+        # Let the transformer see what the binding encoder thinks (detached)
+        prior_tok  = self.prior_proj(binding_prior.detach().unsqueeze(-1))  # [N_qry, D]
+        qry_tokens = qry_tokens + prior_tok
 
         # Unit 3: add density signal to query tokens
         density_t   = torch.tensor([[density]], dtype=torch.float32, device=device)  # [1, 1]
@@ -285,6 +331,13 @@ class ProteinLigandTNP(nn.Module):
         else:
             ctx_mean = torch.tensor(global_mean_affinity, dtype=torch.float32, device=device)
         mu = mu + ctx_mean
+
+        # Unit 7: add binding encoder contribution, density-gated.
+        # Cold-start (density≈0): binding_prior contributes fully — direct
+        # protein-drug features carry the ranking signal.
+        # Warm (density→1): contribution fades to zero — transformer's
+        # neighbor-transfer signal takes over completely.
+        mu = mu + binding_prior * (1.0 - density)
 
         # Unit 3: cold-start sigma bias — upward uncertainty when n_ctx is small
         # Bias decays to zero as density → 1 (warm regime)
