@@ -1,254 +1,438 @@
 """
-TNP prequential streaming experiment with cold-start improvements:
-  Unit 1 — Cold-start evaluation harness (regime tracking)
-  Unit 2 — Synthetic prior context token (--enable-synthetic-prior)
-  Unit 3 — Context density gating (always on, in model architecture)
-  Unit 4 — PPR centroid interpolation (always on, in model architecture)
-  Unit 5 — Drug analog context injection (--drug-analogs)
-  Unit 6 — Protein GNN pre-encoder (--use-gnn)
+Strict prequential TNP experiment runner with debug-oriented baselines.
+
+This script keeps the cold-start evaluator honest:
+  - revealed binding history is explicit (`--history-mode`)
+  - duplicate protein-drug reveals are deduplicated
+  - `binds_activity` merging uses an explicit reduction policy
+  - simple baselines can be compared against the full TNP in the same harness
 """
+
+from __future__ import annotations
+
 import argparse
 import os
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.optim import Adam
 
-from src.data.multiplex_loader import MultiplexPillarSampler
+from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.diverse_replay_buffer import DiverseReplayBuffer
+from src.data.multiplex_loader import MultiplexPillarSampler
+from src.models.tnp import BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
-from src.models.tnp import ProteinLigandTNP
-from src.training.tnp_loss import TNPLoss
-from src.training.metrics import calculate_ci, calculate_ef_at_k
 from src.training.cold_start_metrics import classify_regime, summarize_cold_start
+from src.training.metrics import calculate_ci, calculate_ef_at_k
+from src.training.tnp_loss import TNPLoss
+
+
+class GlobalMeanAffinityModel(nn.Module):
+    """Constant floor baseline: every query gets the global mean affinity."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_forward_stats = {}
+
+    def forward(
+        self,
+        qry_protein: torch.Tensor,
+        qry_drug: torch.Tensor,
+        global_mean_affinity: float = 6.5,
+    ):
+        mu = torch.full(
+            (qry_protein.size(0),),
+            float(global_mean_affinity),
+            dtype=qry_protein.dtype,
+            device=qry_protein.device,
+        )
+        sigma = torch.ones_like(mu)
+        self.last_forward_stats = {
+            "mu_std": 0.0,
+            "binding_prior_std": 0.0,
+            "log_ppr_alpha": 0.0,
+            "centroid_alpha": 0.0,
+            "density": 0.0,
+        }
+        return mu, sigma
 
 
 def precompute_go_fingerprints(data):
-    """
-    Unit 9: Mean-pool anc2vec GO embeddings per protein.
-    Returns [N_proteins, go_dim] tensor, or None if GO data unavailable.
-    """
+    """Mean-pool anc2vec GO embeddings per protein."""
     edge_key = ("protein", "relates", "go")
     if "go" not in data.node_types or edge_key not in data.edge_types:
         return None
-    go_x    = data["go"].x                                      # [N_go, go_dim]
-    ei      = data[edge_key].edge_index                         # [2, N_edges]
-    prot_idx, go_idx = ei[0], ei[1]
-    N_p, go_dim = data["protein"].x.size(0), go_x.size(1)
-    device  = data["protein"].x.device
-    go_fp   = torch.zeros(N_p, go_dim, device=device)
-    count   = torch.zeros(N_p, device=device)
-    go_fp.index_add_(0, prot_idx, go_x[go_idx].to(device))
-    count.index_add_(0, prot_idx, torch.ones(prot_idx.size(0), device=device))
-    count   = count.clamp(min=1.0)
-    go_fp   = go_fp / count.unsqueeze(1)
-    n_annotated = int((count > 1).sum())
-    print(f"  GO fingerprints: {n_annotated}/{N_p} proteins annotated (dim={go_dim})")
-    return go_fp
+
+    go_x = data["go"].x
+    edge_index = data[edge_key].edge_index
+    prot_idx, go_idx = edge_index[0], edge_index[1]
+    n_proteins, go_dim = data["protein"].x.size(0), go_x.size(1)
+    device = data["protein"].x.device
+
+    pooled = torch.zeros(n_proteins, go_dim, device=device)
+    counts = torch.zeros(n_proteins, device=device)
+    pooled.index_add_(0, prot_idx, go_x[go_idx].to(device))
+    counts.index_add_(0, prot_idx, torch.ones(prot_idx.size(0), device=device))
+    annotated = int((counts > 0).sum().item())
+    pooled = pooled / counts.clamp(min=1.0).unsqueeze(1)
+    print(f"  GO fingerprints: {annotated}/{n_proteins} proteins annotated (dim={go_dim})")
+    return pooled
 
 
-def create_pactivity_edges(data):
-    ei_list, y_list = [], []
-    for m in ["binds_pic50", "binds_pki", "binds_pkd"]:
-        if ("protein", m, "drug") in data.edge_types:
-            ei_list.append(data["protein", m, "drug"].edge_index)
-            y_list.append(data["protein", m, "drug"].edge_label)
-    if not ei_list:
-        return data
-    combined_ei = torch.cat(ei_list, dim=1)
-    combined_y  = torch.cat(y_list, dim=0)
-    max_drug = data["drug"].num_nodes
-    edge_hashes = combined_ei[0] * max_drug + combined_ei[1]
-    _, unique_idx = np.unique(edge_hashes.cpu().numpy(), return_index=True)
-    data["protein", "binds_activity", "drug"].edge_index = combined_ei[:, unique_idx]
-    data["protein", "binds_activity", "drug"].edge_label = combined_y[unique_idx]
-    return data
-
-
-def sample_replay_batch(
-    loader, replay_protein_indices, replay_edges_per_protein=256
-):
-    """Fetch replay batches for the given protein indices from the loader history."""
+def sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein=256):
+    """Fetch replay batches for the given protein indices from revealed history."""
     replay_batches = []
     for replay_protein_idx in replay_protein_indices:
-        mask     = loader.binds_ei[0] == replay_protein_idx
+        mask = loader.binds_ei[0] == replay_protein_idx
         edge_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
         if edge_idx.numel() == 0:
             continue
-        k      = min(replay_edges_per_protein, edge_idx.numel())
+        k = min(replay_edges_per_protein, edge_idx.numel())
         chosen = edge_idx[torch.randperm(edge_idx.numel(), device=edge_idx.device)[:k]]
-        replay_edges  = loader.binds_ei[:, chosen]
+        replay_edges = loader.binds_ei[:, chosen]
         replay_labels = loader.binds_y[chosen]
         replay_pillar = loader.get_pillar_context(int(replay_protein_idx))
         replay_batches.append((int(replay_protein_idx), replay_edges, replay_labels, replay_pillar))
     return replay_batches
 
 
-def run_episode(model, builder, drug_features, pillar, query_drug_indices,
-                gnn_all_embs=None, global_mean_affinity=6.5, per_query_k=0):
-    """
-    Forward pass for one protein episode. Returns (mu, sigma).
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Strict TNP prequential streaming experiment")
+    parser.add_argument("--data", default="data/final_graph_data_not_normalized.pt")
+    parser.add_argument("--priors", default="data/multiplex_priors.pt")
+    parser.add_argument("--run-name", default=None, help="Output stem for model/results files")
+    parser.add_argument("--n-episodes", type=int, default=None, help="Limit number of episodes (default: all)")
+    parser.add_argument("--seed", type=int, default=42, help="Protein stream seed")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--token-dim", type=int, default=256)
+    parser.add_argument("--max-context", type=int, default=256)
+    parser.add_argument("--replay-weight", type=float, default=0.5)
+    parser.add_argument("--merge-reduce", choices=["amax", "mean"], default="amax")
+    parser.add_argument("--model-kind", choices=["tnp", "binding-only", "global-mean"], default="tnp")
+    parser.add_argument("--history-mode", choices=["empty", "full"], default="empty")
+    parser.add_argument("--strict-baseline", action="store_true", help="Force the minimal strict-debug configuration")
+    parser.add_argument("--cold-start-only", action="store_true", help="Evaluation-only mode; skip parameter updates")
+    parser.add_argument("--enable-synthetic-prior", action="store_true", help="Inject synthetic prior token at cold-start")
+    parser.add_argument("--drug-analogs", action="store_true", help="Enable drug analog context injection")
+    parser.add_argument("--analog-top-k", type=int, default=32, help="Top-K analogues per drug")
+    parser.add_argument("--use-go", action="store_true", help="Inject GO anc2vec fingerprints into the protein encoder")
+    parser.add_argument("--per-query-k", type=int, default=0, help="Per-query context size (>0 enables dynamic context)")
+    parser.add_argument("--use-gnn", action="store_true", help="Backward-compatible shortcut for --gnn-mode frozen")
+    parser.add_argument("--gnn-mode", choices=["off", "frozen", "trainable"], default="off")
+    parser.add_argument("--gnn-out-dim", type=int, default=256, help="Protein GNN embedding dimension")
+    parser.add_argument("--train-scope", choices=["full", "head-only"], default="full")
+    parser.add_argument("--unfreeze-after", type=int, default=None, help="Episode index at which TNP switches from head-only to full")
+    parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
+    parser.add_argument("--binding-warmstart", default=None, help="Optional binding-encoder checkpoint")
+    return parser
 
-    Args:
-        gnn_all_embs:       [N_proteins, gnn_dim] precomputed GNN embeddings or None
-        global_mean_affinity: fallback anchor for cold-start (n_ctx == 0)
-        per_query_k:        >0 → use per-query dynamic context (Unit 8)
-    """
-    target       = pillar["target_features"]
-    ppr_centroid = pillar.get("ppr_centroid")
-    n_q          = query_drug_indices.size(0)
-    qry_protein  = target.unsqueeze(0).expand(n_q, -1)
-    qry_drug     = drug_features[query_drug_indices]
 
-    qry_gnn_emb = None
-    if gnn_all_embs is not None:
-        target_idx  = int(pillar["target_idx"])
-        qry_gnn_emb = gnn_all_embs[target_idx].unsqueeze(0).expand(n_q, -1)
+def apply_presets(args):
+    if args.use_gnn and args.gnn_mode == "off":
+        args.gnn_mode = "frozen"
 
-    # Unit 9: GO fingerprint for the target protein
-    qry_go_fp = None
-    if builder.go_fingerprints is not None:
-        target_idx = int(pillar["target_idx"])
-        qry_go_fp  = builder.go_fingerprints[target_idx].unsqueeze(0).expand(n_q, -1)
+    if args.strict_baseline:
+        args.history_mode = "empty"
+        args.enable_synthetic_prior = False
+        args.drug_analogs = False
+        args.use_go = False
+        args.per_query_k = 0
+        args.gnn_mode = "off"
 
-    if per_query_k > 0:
-        # Unit 8: per-query dynamic context
-        pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp = \
-            builder.build_per_query_context(pillar, query_drug_indices, per_query_k)
-        return model.forward_per_query(
-            pq_p, pq_d, pq_a, pq_ppr, pq_trust,
-            qry_protein, qry_drug, pq_aff_mean,
-            pq_gnn_emb=pq_gnn,
-            qry_gnn_emb=qry_gnn_emb,
-            pq_go_fp=pq_go_fp,
-            qry_go_fp=qry_go_fp,
-            ppr_centroid=ppr_centroid,
+    if args.model_kind != "tnp" and args.gnn_mode != "off":
+        print(f"Ignoring gnn_mode={args.gnn_mode} for model_kind={args.model_kind}")
+        args.gnn_mode = "off"
+
+    if args.model_kind != "tnp" and args.train_scope != "full":
+        print(f"Ignoring train_scope={args.train_scope} for model_kind={args.model_kind}")
+        args.train_scope = "full"
+
+    return args
+
+
+def default_run_name(args):
+    parts = ["stream", args.model_kind.replace("-", "_"), args.history_mode]
+    if args.strict_baseline:
+        parts.append("strict")
+    if args.per_query_k > 0:
+        parts.append(f"pq{args.per_query_k}")
+    if args.enable_synthetic_prior:
+        parts.append("syn")
+    if args.use_go:
+        parts.append("go")
+    if args.drug_analogs:
+        parts.append("analogs")
+    if args.gnn_mode != "off":
+        parts.append(f"gnn_{args.gnn_mode}")
+    return "_".join(parts)
+
+
+def set_tnp_train_scope(model, scope: str):
+    if not isinstance(model, ProteinLigandTNP):
+        return
+    if scope == "full":
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+
+    if scope != "head-only":
+        raise ValueError(f"Unsupported train_scope='{scope}'")
+
+    for param in model.parameters():
+        param.requires_grad = False
+    for module in (model.output_head, model.binding_encoder, model.prior_proj):
+        for param in module.parameters():
+            param.requires_grad = True
+    model.cold_start_bias.requires_grad = True
+
+
+def maybe_load_binding_warmstart(model, path, device):
+    if path is None or not hasattr(model, "binding_encoder"):
+        return
+
+    state = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+
+    binding_state = {}
+    if isinstance(state, dict):
+        for key, value in state.items():
+            if key.startswith("binding_encoder."):
+                binding_state[key.split("binding_encoder.", 1)[1]] = value
+
+    if not binding_state and isinstance(state, dict):
+        binding_state = {k: v for k, v in state.items() if k.startswith("net.")}
+
+    if not binding_state:
+        raise ValueError(f"No binding_encoder weights found in {path}")
+
+    missing, unexpected = model.binding_encoder.load_state_dict(binding_state, strict=False)
+    print(f"Loaded binding warmstart from {path} | missing={len(missing)} unexpected={len(unexpected)}")
+
+
+def maybe_load_model_warmstart(model, path, device):
+    if path is None:
+        return
+    state = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"Loaded model warmstart from {path} | missing={len(missing)} unexpected={len(unexpected)}")
+
+
+def build_gnn_runtime(args, data, prot_dim, device):
+    if args.gnn_mode == "off":
+        return None, 0
+
+    from src.models.protein_gnn import ProteinGNN, compute_all_embeddings
+
+    print(f"Initialising ProteinGNN (mode={args.gnn_mode}, out_dim={args.gnn_out_dim})...")
+    gnn_model = ProteinGNN(in_dim=prot_dim, hidden_dim=128, out_dim=args.gnn_out_dim).to(device)
+    form_ei = data["protein", "similar", "protein"].edge_index
+    role_ei = data["protein", "go_shared", "protein"].edge_index
+    cached_embs = None
+    if args.gnn_mode == "frozen":
+        cached_embs = compute_all_embeddings(gnn_model, data["protein"].x, form_ei, role_ei)
+        print(f"GNN embeddings cached: {cached_embs.shape}")
+
+    return {
+        "mode": args.gnn_mode,
+        "model": gnn_model,
+        "protein_x": data["protein"].x,
+        "form_ei": form_ei,
+        "role_ei": role_ei,
+        "cached_embs": cached_embs,
+    }, args.gnn_out_dim
+
+
+def current_gnn_embeddings(gnn_runtime):
+    if gnn_runtime is None:
+        return None
+    if gnn_runtime["mode"] == "frozen":
+        return gnn_runtime["cached_embs"]
+    return gnn_runtime["model"](
+        gnn_runtime["protein_x"],
+        gnn_runtime["form_ei"],
+        gnn_runtime["role_ei"],
+    )
+
+
+def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
+    if args.model_kind == "global-mean":
+        model = GlobalMeanAffinityModel()
+    elif args.model_kind == "binding-only":
+        model = BindingOnlyAffinityModel(prot_dim, drug_dim)
+    else:
+        model = ProteinLigandTNP(
+            prot_dim,
+            drug_dim,
+            token_dim=args.token_dim,
+            gnn_emb_dim=gnn_emb_dim,
+            go_fp_dim=go_fp_dim,
         )
 
-    # Shared context path (default)
-    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn, ctx_go_fp = builder.build_context(
-        pillar, query_drug_indices
-    )
-    return model(
-        ctx_p, ctx_d, ctx_a,
-        qry_protein, qry_drug,
-        ctx_ppr, ctx_trust,
-        ppr_centroid=ppr_centroid,
-        ctx_gnn_emb=ctx_gnn,
-        qry_gnn_emb=qry_gnn_emb,
-        ctx_go_fp=ctx_go_fp,
-        qry_go_fp=qry_go_fp,
-        global_mean_affinity=global_mean_affinity,
-    )
+    model = model.to(device)
+    maybe_load_model_warmstart(model, args.warmstart_checkpoint, device)
+    maybe_load_binding_warmstart(model, args.binding_warmstart, device)
+    set_tnp_train_scope(model, args.train_scope)
+    return model
+
+
+def build_optimizer(args, model, loss_fn, gnn_runtime):
+    if args.cold_start_only or args.model_kind == "global-mean":
+        return None
+
+    param_groups = []
+    model_params = list(model.parameters())
+    if model_params:
+        param_groups.append({"params": model_params, "lr": args.lr})
+    if gnn_runtime is not None and gnn_runtime["mode"] == "trainable":
+        param_groups.append({"params": list(gnn_runtime["model"].parameters()), "lr": args.lr})
+    if loss_fn is not None:
+        param_groups.append({"params": list(loss_fn.parameters()), "lr": args.lr * 10})
+    return Adam(param_groups)
+
+
+def collect_forward_stats(model):
+    stats = getattr(model, "last_forward_stats", {})
+    return {
+        "mu_std": float(stats.get("mu_std", 0.0)),
+        "binding_prior_std": float(stats.get("binding_prior_std", 0.0)),
+        "log_ppr_alpha": float(stats.get("log_ppr_alpha", 0.0)),
+        "centroid_alpha": float(stats.get("centroid_alpha", 0.0)),
+        "density": float(stats.get("density", 0.0)),
+    }
+
+
+def run_episode(
+    args,
+    model,
+    builder,
+    drug_features,
+    pillar,
+    query_drug_indices,
+    gnn_runtime=None,
+    global_mean_affinity=6.5,
+):
+    target = pillar["target_features"]
+    ppr_centroid = pillar.get("ppr_centroid")
+    target_idx = int(pillar["target_idx"])
+    n_qry = query_drug_indices.size(0)
+    qry_protein = target.unsqueeze(0).expand(n_qry, -1)
+    qry_drug = drug_features[query_drug_indices]
+
+    all_gnn_embs = current_gnn_embeddings(gnn_runtime)
+    builder.gnn_protein_embs = all_gnn_embs
+
+    qry_gnn_emb = None
+    if all_gnn_embs is not None:
+        qry_gnn_emb = all_gnn_embs[target_idx].unsqueeze(0).expand(n_qry, -1)
+
+    qry_go_fp = None
+    if builder.go_fingerprints is not None:
+        qry_go_fp = builder.go_fingerprints[target_idx].unsqueeze(0).expand(n_qry, -1)
+
+    if args.per_query_k > 0:
+        pq_p, pq_d, pq_a, pq_ppr, pq_trust, pq_gnn, pq_aff_mean, pq_go_fp = builder.build_per_query_context(
+            pillar, query_drug_indices, args.per_query_k
+        )
+        n_ctx = int(pq_p.size(1))
+        if args.model_kind == "tnp":
+            mu, sigma = model.forward_per_query(
+                pq_p,
+                pq_d,
+                pq_a,
+                pq_ppr,
+                pq_trust,
+                qry_protein,
+                qry_drug,
+                pq_aff_mean,
+                pq_gnn_emb=pq_gnn,
+                qry_gnn_emb=qry_gnn_emb,
+                pq_go_fp=pq_go_fp,
+                qry_go_fp=qry_go_fp,
+                ppr_centroid=ppr_centroid,
+            )
+        else:
+            mu, sigma = model(qry_protein, qry_drug, global_mean_affinity=global_mean_affinity)
+    else:
+        ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust, ctx_gnn, ctx_go_fp = builder.build_context(
+            pillar, query_drug_indices
+        )
+        n_ctx = int(ctx_p.size(0))
+        if args.model_kind == "tnp":
+            mu, sigma = model(
+                ctx_p,
+                ctx_d,
+                ctx_a,
+                qry_protein,
+                qry_drug,
+                ctx_ppr,
+                ctx_trust,
+                ppr_centroid=ppr_centroid,
+                ctx_gnn_emb=ctx_gnn,
+                qry_gnn_emb=qry_gnn_emb,
+                ctx_go_fp=ctx_go_fp,
+                qry_go_fp=qry_go_fp,
+                global_mean_affinity=global_mean_affinity,
+            )
+        else:
+            mu, sigma = model(qry_protein, qry_drug, global_mean_affinity=global_mean_affinity)
+
+    stats = collect_forward_stats(model)
+    stats["n_ctx"] = n_ctx
+    return mu, sigma, stats
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TNP prequential streaming experiment")
-    parser.add_argument("--data",     default="data/final_graph_data_not_normalized.pt")
-    parser.add_argument("--priors",   default="data/multiplex_priors.pt")
-    parser.add_argument("--n-episodes", type=int, default=None,
-                        help="Limit number of episodes (default: all)")
-    parser.add_argument("--lr",         type=float, default=1e-4)
-    parser.add_argument("--token-dim",  type=int,   default=256)
-    parser.add_argument("--max-context", type=int,  default=256)
-    parser.add_argument("--replay-weight", type=float, default=0.5)
-
-    # Unit 1: cold-start only mode
-    parser.add_argument("--cold-start-only", action="store_true",
-                        help="Evaluation-only mode; skip training (Unit 1)")
-
-    # Unit 2: synthetic prior
-    parser.add_argument("--enable-synthetic-prior", action="store_true",
-                        help="Inject synthetic prior token at cold-start (Unit 2)")
-
-    # Unit 5: drug analog injection
-    parser.add_argument("--drug-analogs", action="store_true",
-                        help="Enable drug analog context injection (Unit 5)")
-    parser.add_argument("--analog-top-k", type=int, default=32,
-                        help="Top-K analogues per drug (Unit 5)")
-
-    # Unit 9: GO functional fingerprints (anc2vec mean-pool)
-    parser.add_argument("--use-go", action="store_true",
-                        help="Inject GO anc2vec fingerprints into protein encoder (Unit 9)")
-
-    # Unit 8: per-query dynamic context
-    parser.add_argument("--per-query-k", type=int, default=0,
-                        help="Per-query context size >0 enables Unit 8 (default: 0 = shared)")
-
-    # Unit 6: GNN pre-encoder
-    parser.add_argument("--use-gnn", action="store_true",
-                        help="Enable protein GNN pre-encoder (Unit 6)")
-    parser.add_argument("--gnn-out-dim", type=int, default=256,
-                        help="GNN embedding dimension (Unit 6)")
-    parser.add_argument("--gnn-refresh-interval", type=int, default=100,
-                        help="Episodes between GNN embedding refreshes (Unit 6)")
-
-    args = parser.parse_args()
+    parser = build_arg_parser()
+    args = apply_presets(parser.parse_args())
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     print(f"Loading data from {args.data}...")
     data = torch.load(args.data, weights_only=False).to(device)
-    data = create_pactivity_edges(data)
+    data = merge_activity_edges(data, reduce=args.merge_reduce)
 
-    prot_dim    = data["protein"].x.size(1)
-    drug_dim    = data["drug"].x.size(1)
+    prot_dim = data["protein"].x.size(1)
+    drug_dim = data["drug"].x.size(1)
     drug_features = data["drug"].x
+    run_name = args.run_name or default_run_name(args)
 
-    loader   = MultiplexPillarSampler(data, binds_metric="binds_activity",
-                                      priors_cache_path=args.priors,
-                                      temporal_decay=0.0)
+    loader = MultiplexPillarSampler(
+        data,
+        binds_metric="binds_activity",
+        priors_cache_path=args.priors,
+        temporal_decay=0.0,
+        history_mode=args.history_mode,
+    )
     replay_buffer = DiverseReplayBuffer(max_size=1000, protein_dim=prot_dim, device=device)
-    episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
+    episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15, seed=args.seed)
     if args.n_episodes is not None:
         episodes = episodes[:args.n_episodes]
     print(f"Stream: {len(episodes)} episodes")
 
-    # --- Unit 2: Compute global statistics for synthetic prior ---
-    global_drug_mean     = drug_features.mean(0)
-    global_mean_affinity = float(
-        data["protein", "binds_activity", "drug"].edge_label.mean()
-    )
+    global_drug_mean = drug_features.mean(0)
+    global_mean_affinity = float(data["protein", "binds_activity", "drug"].edge_label.mean())
     print(f"Global mean affinity: {global_mean_affinity:.3f}")
 
-    # --- Unit 5: Drug analog index ---
     drug_analog_index = None
     if args.drug_analogs:
         print(f"Building DrugAnalogIndex (top_k={args.analog_top_k})...")
         from src.data.drug_analog_index import DrugAnalogIndex
+
         drug_analog_index = DrugAnalogIndex(drug_features, top_k=args.analog_top_k)
         print("DrugAnalogIndex ready.")
 
-    # --- Unit 6: Protein GNN pre-encoder ---
-    gnn_all_embs = None
-    protein_gnn  = None
-    gnn_emb_dim  = 0
-    if args.use_gnn:
-        print(f"Initialising ProteinGNN (out_dim={args.gnn_out_dim})...")
-        from src.models.protein_gnn import ProteinGNN, compute_all_embeddings
-        protein_gnn = ProteinGNN(
-            in_dim=prot_dim, hidden_dim=128, out_dim=args.gnn_out_dim
-        ).to(device)
-        gnn_emb_dim = args.gnn_out_dim
-        form_ei = data["protein", "similar",   "protein"].edge_index
-        role_ei = data["protein", "go_shared", "protein"].edge_index
-        gnn_all_embs = compute_all_embeddings(
-            protein_gnn, data["protein"].x, form_ei, role_ei
-        )
-        print(f"GNN embeddings: {gnn_all_embs.shape}")
+    gnn_runtime, gnn_emb_dim = build_gnn_runtime(args, data, prot_dim, device)
 
-    # --- Unit 9: GO fingerprints ---
-    go_fingerprints = None
-    go_fp_dim       = 0
-    if args.use_go:
-        go_fingerprints = precompute_go_fingerprints(data)
-        if go_fingerprints is not None:
-            go_fp_dim = go_fingerprints.size(1)
+    go_fingerprints = precompute_go_fingerprints(data) if args.use_go else None
+    go_fp_dim = 0 if go_fingerprints is None else int(go_fingerprints.size(1))
 
-    # --- Build context builder ---
     builder = TNPContextBuilder(
         drug_features,
         max_context=args.max_context,
@@ -256,160 +440,184 @@ def main():
         global_mean_affinity=global_mean_affinity,
         enable_synthetic_prior=args.enable_synthetic_prior,
         drug_analog_index=drug_analog_index,
-        gnn_protein_embs=gnn_all_embs,
+        gnn_protein_embs=None if gnn_runtime is None else gnn_runtime.get("cached_embs"),
     )
     builder.go_fingerprints = go_fingerprints
 
-    # --- Build model ---
-    model = ProteinLigandTNP(
-        prot_dim, drug_dim,
-        token_dim=args.token_dim,
-        gnn_emb_dim=gnn_emb_dim,
-        go_fp_dim=go_fp_dim,
-    ).to(device)
+    model = build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device)
+    loss_fn = None if args.model_kind == "global-mean" else TNPLoss().to(device)
+    optimizer = build_optimizer(args, model, loss_fn, gnn_runtime)
 
-
-    loss_fn   = TNPLoss().to(device)
-    model_params = list(model.parameters())
-    if protein_gnn is not None:
-        model_params += list(protein_gnn.parameters())
-    # log_var scalars are three lightweight calibration parameters — they need
-    # to adapt much faster than the transformer weights to be effective.
-    optimizer = Adam([
-        {"params": model_params,               "lr": args.lr},
-        {"params": list(loss_fn.parameters()), "lr": args.lr * 10},
-    ])
-
-    print("\nSTARTING TNP PREQUENTIAL STREAM")
+    print("\nSTARTING STRICT PREQUENTIAL STREAM")
+    print(f"  run name:        {run_name}")
+    print(f"  model kind:      {args.model_kind}")
+    print(f"  history mode:    {args.history_mode}")
+    print(f"  train scope:     {args.train_scope}")
+    print(f"  gnn mode:        {args.gnn_mode}")
     print(f"  synthetic prior: {args.enable_synthetic_prior}")
     print(f"  drug analogs:    {args.drug_analogs}")
-    print(f"  GNN pre-encoder: {args.use_gnn}")
-    print(f"  cold-start only: {args.cold_start_only}")
-    print(f"  per-query-k:     {args.per_query_k} {'(Unit 8 enabled)' if args.per_query_k > 0 else '(shared context)'}")
     print(f"  GO fingerprints: {args.use_go} (dim={go_fp_dim})")
-    print("-" * 70)
+    print(f"  per-query-k:     {args.per_query_k} {'(dynamic context)' if args.per_query_k > 0 else '(shared context)'}")
+    print(f"  cold-start only: {args.cold_start_only}")
+    print("-" * 72)
 
-    os.makedirs("models",   exist_ok=True)
-    os.makedirs("results",  exist_ok=True)
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
 
-    episode_log  = []
-    ci_history   = []
+    model_path = os.path.join("models", f"{run_name}.pt")
+    results_path = os.path.join("results", f"{run_name}.csv")
+    summary_path = os.path.join("results", f"{run_name}_cold_start_summary.csv")
+
+    episode_log = []
+    ci_history = []
     ef10_history = []
-    ROLL = 100
+    regime_counts = {"cold": 0, "sparse": 0, "warm": 0}
+    roll_window = 100
+    train_scope_upgraded = False
 
     for i, ep in enumerate(episodes):
         loader.begin_episode(i)
+        if (
+            isinstance(model, ProteinLigandTNP)
+            and args.train_scope == "head-only"
+            and args.unfreeze_after is not None
+            and i >= args.unfreeze_after
+            and not train_scope_upgraded
+        ):
+            set_tnp_train_scope(model, "full")
+            train_scope_upgraded = True
+            print(f"Episode {i}: switching TNP train scope from head-only to full")
+
         pillar = loader.get_pillar_context(ep.protein_idx)
-        n_ctx  = int(
-            pillar["form_binds_ei"].size(1) + pillar["role_binds_ei"].size(1)
-        )
+        history_before = loader.history_stats()
 
-        # Unit 1: classify regime
-        regime = classify_regime(n_ctx)
-
-        # --- EVALUATION (cold-start, labels not yet revealed) ---
         model.eval()
         with torch.no_grad():
-            mu_eval, sigma_eval = run_episode(
-                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
+            mu_eval, sigma_eval, eval_stats = run_episode(
+                args,
+                model,
+                builder,
+                drug_features,
+                pillar,
+                ep.edges[1],
+                gnn_runtime=gnn_runtime,
                 global_mean_affinity=global_mean_affinity,
-                per_query_k=args.per_query_k,
             )
-        ci_val     = calculate_ci(ep.labels, mu_eval)
-        ef10_val   = calculate_ef_at_k(ep.labels, mu_eval, k=0.1)
+
+        n_ctx = int(eval_stats["n_ctx"])
+        regime = classify_regime(n_ctx)
+        regime_counts[regime] += 1
+        if args.history_mode == "empty" and i == 0 and n_ctx != 0:
+            raise RuntimeError(
+                f"Episode 0 should be cold under strict history_mode=empty, but n_ctx={n_ctx}. "
+                "This indicates preloaded history leakage."
+            )
+
+        ci_val = calculate_ci(ep.labels, mu_eval)
+        ef10_val = calculate_ef_at_k(ep.labels, mu_eval, k=0.1)
         mean_sigma = float(sigma_eval.mean().detach())
 
         ci_history.append(ci_val)
         ef10_history.append(ef10_val)
-        ci_roll   = float(sum(ci_history[-ROLL:])   / len(ci_history[-ROLL:]))
-        ef10_roll = float(sum(ef10_history[-ROLL:]) / len(ef10_history[-ROLL:]))
+        ci_roll = float(sum(ci_history[-roll_window:]) / len(ci_history[-roll_window:]))
+        ef10_roll = float(sum(ef10_history[-roll_window:]) / len(ef10_history[-roll_window:]))
 
-        train_loss      = 0.0
-        nll_val         = 0.0
-        replay_loss_val = 0.0
-        w_nll = w_listnet = w_lambda = 0.0
+        train_loss = float("nan")
+        nll_val = float("nan")
+        replay_loss_val = float("nan")
+        w_nll = float("nan")
+        w_listnet = float("nan")
+        w_lambda = float("nan")
 
-        if not args.cold_start_only:
-            # --- TRAINING ---
+        if optimizer is not None and loss_fn is not None:
             model.train()
+            loss_fn.train()
             optimizer.zero_grad()
             loss_fn.step_schedule(i, len(episodes))
 
-            mu_train, sigma_train = run_episode(
-                model, builder, drug_features, pillar, ep.edges[1], gnn_all_embs,
+            mu_train, sigma_train, _ = run_episode(
+                args,
+                model,
+                builder,
+                drug_features,
+                pillar,
+                ep.edges[1],
+                gnn_runtime=gnn_runtime,
                 global_mean_affinity=global_mean_affinity,
-                per_query_k=args.per_query_k,
             )
             train_result = loss_fn(mu_train, sigma_train, ep.labels.to(device))
             train_result["total_loss"].backward()
 
             train_loss = float(train_result["total_loss"].detach())
-            nll_val    = float(train_result["nll"].detach())
-            w_nll      = float(train_result["w_nll"])
-            w_listnet  = float(train_result["w_listnet"])
-            w_lambda   = float(train_result["w_lambda"])
+            nll_val = float(train_result["nll"].detach())
+            w_nll = float(train_result["w_nll"])
+            w_listnet = float(train_result["w_listnet"])
+            w_lambda = float(train_result["w_lambda"])
 
-            # Experience replay — diverse coreset sampling
             replay_protein_indices = replay_buffer.sample(25)
-            replay_batches = sample_replay_batch(
-                loader, replay_protein_indices,
-                replay_edges_per_protein=256,
-            )
+            replay_batches = sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein=256)
             if replay_batches:
                 replay_total = torch.tensor(0.0, device=device)
-                for _, r_edges, r_labels, r_pillar in replay_batches:
-                    r_mu, r_sigma = run_episode(
-                        model, builder, drug_features, r_pillar, r_edges[1], gnn_all_embs,
+                for _, replay_edges, replay_labels, replay_pillar in replay_batches:
+                    replay_mu, replay_sigma, _ = run_episode(
+                        args,
+                        model,
+                        builder,
+                        drug_features,
+                        replay_pillar,
+                        replay_edges[1],
+                        gnn_runtime=gnn_runtime,
                         global_mean_affinity=global_mean_affinity,
-                        per_query_k=args.per_query_k,
                     )
-                    r_result     = loss_fn(r_mu, r_sigma, r_labels.to(device))
-                    replay_total = replay_total + r_result["total_loss"]
-                replay_total  = replay_total / len(replay_batches)
+                    replay_result = loss_fn(replay_mu, replay_sigma, replay_labels.to(device))
+                    replay_total = replay_total + replay_result["total_loss"]
+                replay_total = replay_total / len(replay_batches)
                 (args.replay_weight * replay_total).backward()
                 replay_loss_val = float(replay_total.detach())
 
-            torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(loss_fn.parameters()), 1.0
-            )
+            clip_params = list(model.parameters()) + list(loss_fn.parameters())
+            if gnn_runtime is not None and gnn_runtime["mode"] == "trainable":
+                clip_params += list(gnn_runtime["model"].parameters())
+            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             optimizer.step()
-
-            # Unit 6: refresh GNN embeddings periodically
-            if (
-                protein_gnn is not None
-                and i % args.gnn_refresh_interval == 0
-                and i > 0
-            ):
-                from src.models.protein_gnn import compute_all_embeddings
-                gnn_all_embs = compute_all_embeddings(
-                    protein_gnn, data["protein"].x, form_ei, role_ei
-                )
-                builder.gnn_protein_embs = gnn_all_embs
 
         loader.add_revealed_edges(ep.edges, ep.labels)
         replay_buffer.add(ep.protein_idx, pillar["target_features"])
+        history_after = loader.history_stats()
 
-        if i % 50 == 0 and i > 0:
-            torch.save(model.state_dict(), f"models/tnp_checkpoint_ep{i:04d}.pt")
-
-        episode_log.append({
-            "episode":      i,
-            "protein_idx":  ep.protein_idx,
-            "regime":       regime,           # Unit 1
-            "ci":           ci_val,
-            "ef10":         ef10_val,
-            "ci_roll100":   ci_roll,
-            "ef10_roll100": ef10_roll,
-            "mean_sigma":   mean_sigma,
-            "total_loss":   train_loss,
-            "nll":          nll_val,
-            "replay_loss":  replay_loss_val,
-            "n_ctx":        n_ctx,
-            "n_preds":      ep.labels.numel(),
-            "w_nll":        w_nll,
-            "w_listnet":    w_listnet,
-            "w_lambda":     w_lambda,
-        })
+        episode_log.append(
+            {
+                "episode": i,
+                "protein_idx": ep.protein_idx,
+                "regime": regime,
+                "ci": ci_val,
+                "ef10": ef10_val,
+                "ci_roll100": ci_roll,
+                "ef10_roll100": ef10_roll,
+                "mean_sigma": mean_sigma,
+                "total_loss": train_loss,
+                "nll": nll_val,
+                "replay_loss": replay_loss_val,
+                "n_ctx": n_ctx,
+                "n_preds": ep.labels.numel(),
+                "revealed_edge_count": history_before["revealed_edge_count"],
+                "unique_revealed_edge_count": history_before["unique_revealed_edge_count"],
+                "duplicate_revealed_edges": history_before["duplicate_revealed_edges"],
+                "revealed_edge_count_after": history_after["revealed_edge_count"],
+                "unique_revealed_edge_count_after": history_after["unique_revealed_edge_count"],
+                "mu_std": eval_stats["mu_std"],
+                "binding_prior_std": eval_stats["binding_prior_std"],
+                "log_ppr_alpha": eval_stats["log_ppr_alpha"],
+                "centroid_alpha": eval_stats["centroid_alpha"],
+                "density": eval_stats["density"],
+                "regime_count_cold": regime_counts["cold"],
+                "regime_count_sparse": regime_counts["sparse"],
+                "regime_count_warm": regime_counts["warm"],
+                "w_nll": w_nll,
+                "w_listnet": w_listnet,
+                "w_lambda": w_lambda,
+            }
+        )
 
         if i % 5 == 0:
             print(
@@ -417,23 +625,33 @@ def main():
                 f" | CI: {ci_val:.3f} (roll100: {ci_roll:.3f})"
                 f" | σ: {mean_sigma:.3f}"
                 f" | n_ctx: {n_ctx}"
-                f" | weights -> NLL: {w_nll:.4f}, ListNet: {w_listnet:.4f}, Lambda: {w_lambda:.4f}"
+                f" | history: {history_before['revealed_edge_count']} -> {history_after['revealed_edge_count']}"
+                f" | dup: {history_after['duplicate_revealed_edges']}"
+                f" | mu_std: {eval_stats['mu_std']:.3f}"
+                f" | binding_std: {eval_stats['binding_prior_std']:.3f}"
             )
 
-    print("\nSaving TNP model...")
-    torch.save(model.state_dict(), "models/oracle_tnp_v1.pt")
+    if args.history_mode == "empty" and regime_counts["cold"] + regime_counts["sparse"] == 0:
+        raise RuntimeError("Strict prequential run produced only warm episodes; expected cold/sparse regimes as leakage check.")
+
+    if args.model_kind != "global-mean":
+        print(f"\nSaving model to {model_path}...")
+        torch.save(model.state_dict(), model_path)
 
     df = pd.DataFrame(episode_log)
-    df.to_csv("results/stream_tnp_v1.csv", index=False)
-    print("Saved: models/oracle_tnp_v1.pt  results/stream_tnp_v1.csv")
+    df.to_csv(results_path, index=False)
+    print(f"Saved results: {results_path}")
 
-    # Unit 1: write cold-start summary
     summary = summarize_cold_start(episode_log)
     if not summary.empty:
-        summary.to_csv("results/cold_start_summary.csv")
-        print("Saved: results/cold_start_summary.csv")
+        summary.to_csv(summary_path)
+        print(f"Saved summary: {summary_path}")
         print("\nCold-start summary:")
         print(summary.to_string())
+
+    print("\nFinal regime counts:")
+    for regime_name in ("cold", "sparse", "warm"):
+        print(f"  {regime_name}: {regime_counts[regime_name]}")
 
 
 if __name__ == "__main__":

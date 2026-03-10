@@ -5,23 +5,30 @@ from torch_geometric.utils import scatter
 class MultiplexPillarSampler:
     """Multiplex pillar context via precomputed diffusion priors."""
 
-    def __init__(self, hetero_data, binds_metric="binds_pic50", temporal_decay=0.01, priors_cache_path=None):
+    def __init__(
+        self,
+        hetero_data,
+        binds_metric="binds_pic50",
+        temporal_decay=0.01,
+        priors_cache_path=None,
+        history_mode: str = "full",
+    ):
         self.data = hetero_data
         self.binds_metric = binds_metric
         self.temporal_decay = temporal_decay
         self.current_episode = 0
+        self.history_mode = history_mode
 
         self.form_ei = self.data["protein", "similar", "protein"].edge_index
         self.role_ei = self.data["protein", "go_shared", "protein"].edge_index
-        self.binds_ei = self.data["protein", self.binds_metric, "drug"].edge_index
-        self.binds_y = self.data["protein", self.binds_metric, "drug"].edge_label
-        self.binds_w = getattr(self.data["protein", self.binds_metric, "drug"], "edge_weight", None)
-        if self.binds_w is None:
-            self.binds_w = torch.ones_like(self.binds_y, dtype=torch.float)
-
-        self.edge_birth_t = torch.zeros(self.binds_y.size(0), device=self.binds_y.device)
         self.protein_x = self.data["protein"].x
         self.num_proteins = int(self.data["protein"].num_nodes)
+        full_store = self.data["protein", self.binds_metric, "drug"]
+        self.full_binds_ei = full_store.edge_index
+        self.full_binds_y = full_store.edge_label
+        self.full_binds_w = getattr(full_store, "edge_weight", None)
+        if self.full_binds_w is None:
+            self.full_binds_w = torch.ones_like(self.full_binds_y, dtype=torch.float)
 
         self.priors = torch.load(priors_cache_path, weights_only=False) if priors_cache_path is not None else None
 
@@ -29,6 +36,12 @@ class MultiplexPillarSampler:
         self.form_hash = torch.unique((self.form_ei[0] * n + self.form_ei[1]).to(self.protein_x.device))
         self.role_hash = torch.unique((self.role_ei[0] * n + self.role_ei[1]).to(self.protein_x.device))
 
+        self.binds_ei = torch.empty((2, 0), dtype=torch.long, device=self.protein_x.device)
+        self.binds_y = torch.empty((0,), dtype=self.full_binds_y.dtype, device=self.protein_x.device)
+        self.binds_w = torch.empty((0,), dtype=self.full_binds_w.dtype, device=self.protein_x.device)
+        self.edge_birth_t = torch.empty((0,), dtype=torch.float, device=self.protein_x.device)
+        self.duplicate_revealed_edges = 0
+        self.reset_revealed_history(history_mode=history_mode)
         self._refresh_bind_sorted_index()
 
     def _refresh_bind_sorted_index(self):
@@ -41,6 +54,40 @@ class MultiplexPillarSampler:
 
     def begin_episode(self, episode_idx):
         self.current_episode = int(episode_idx)
+
+    def reset_revealed_history(self, history_mode: str = "empty"):
+        if history_mode not in {"empty", "full"}:
+            raise ValueError(f"Unsupported history_mode='{history_mode}'")
+
+        self.history_mode = history_mode
+        self.duplicate_revealed_edges = 0
+        if history_mode == "full":
+            self.binds_ei = self.full_binds_ei.clone()
+            self.binds_y = self.full_binds_y.clone()
+            self.binds_w = self.full_binds_w.clone()
+            self.edge_birth_t = torch.zeros(self.binds_y.size(0), dtype=torch.float, device=self.binds_y.device)
+        else:
+            device = self.protein_x.device
+            self.binds_ei = torch.empty((2, 0), dtype=torch.long, device=device)
+            self.binds_y = torch.empty((0,), dtype=self.full_binds_y.dtype, device=device)
+            self.binds_w = torch.empty((0,), dtype=self.full_binds_w.dtype, device=device)
+            self.edge_birth_t = torch.empty((0,), dtype=torch.float, device=device)
+        self._refresh_bind_sorted_index()
+
+    def _edge_keys(self, edge_index):
+        if edge_index.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.protein_x.device)
+        num_drugs = int(self.data["drug"].num_nodes)
+        return edge_index[0].long() * num_drugs + edge_index[1].long()
+
+    def history_stats(self):
+        total = int(self.binds_ei.size(1))
+        unique = int(torch.unique(self._edge_keys(self.binds_ei)).numel()) if total > 0 else 0
+        return {
+            "revealed_edge_count": total,
+            "unique_revealed_edge_count": unique,
+            "duplicate_revealed_edges": int(self.duplicate_revealed_edges),
+        }
 
     def _get_diffused_neighbors(self, target_idx):
         device = self.protein_x.device
@@ -192,10 +239,23 @@ class MultiplexPillarSampler:
         if new_weights is None:
             new_weights = torch.ones_like(new_labels, dtype=torch.float)
 
-        self.binds_ei = torch.cat([self.binds_ei, new_edges.to(device)], dim=1)
-        self.binds_y = torch.cat([self.binds_y, new_labels.to(device)], dim=0)
-        self.binds_w = torch.cat([self.binds_w, new_weights.to(device)], dim=0)
+        new_edges = new_edges.to(device)
+        new_labels = new_labels.to(device)
+        new_weights = new_weights.to(device)
+        existing_keys = torch.unique(self._edge_keys(self.binds_ei))
+        new_keys = self._edge_keys(new_edges)
+        is_new = torch.ones(new_keys.size(0), dtype=torch.bool, device=device)
+        if existing_keys.numel() > 0 and new_keys.numel() > 0:
+            is_new = ~torch.isin(new_keys, existing_keys)
+        duplicate_count = int((~is_new).sum().item())
+        self.duplicate_revealed_edges += duplicate_count
+        if not is_new.any():
+            return
 
-        new_birth = torch.full((new_labels.size(0),), float(self.current_episode), device=device)
+        self.binds_ei = torch.cat([self.binds_ei, new_edges[:, is_new]], dim=1)
+        self.binds_y = torch.cat([self.binds_y, new_labels[is_new]], dim=0)
+        self.binds_w = torch.cat([self.binds_w, new_weights[is_new]], dim=0)
+
+        new_birth = torch.full((int(is_new.sum().item()),), float(self.current_episode), device=device)
         self.edge_birth_t = torch.cat([self.edge_birth_t, new_birth], dim=0)
         self._refresh_bind_sorted_index()

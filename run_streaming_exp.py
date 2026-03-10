@@ -1,10 +1,10 @@
 import os
-import numpy as np
 import pandas as pd
 import torch
 import pyro
 from torch.optim import Adam
 
+from src.data.binds_activity import merge_activity_edges
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.protocol.prequential import build_multiplex_stream
 from src.models.smoothing import MultiplexInductiveSmoother
@@ -13,28 +13,6 @@ from src.models.multiplex_moe import MultiplexMoE
 from src.training.ebl_loss import EBLLoss
 from src.training.bayesian_training import build_router_elbo
 from src.training.metrics import calculate_ci, calculate_ef_at_k
-
-
-def create_pactivity_edges(data):
-    """Merges pIC50, pKi, and pKd edges into a single 'binds_activity' edge type."""
-    ei_list, y_list = [], []
-    for m in ["binds_pic50", "binds_pki", "binds_pkd"]:
-        if ("protein", m, "drug") in data.edge_types:
-            ei_list.append(data["protein", m, "drug"].edge_index)
-            y_list.append(data["protein", m, "drug"].edge_label)
-
-    if not ei_list:
-        return data
-
-    combined_ei = torch.cat(ei_list, dim=1)
-    combined_y = torch.cat(y_list, dim=0)
-    max_drug = data["drug"].num_nodes
-    edge_hashes = combined_ei[0] * max_drug + combined_ei[1]
-    _, unique_idx = np.unique(edge_hashes.cpu().numpy(), return_index=True)
-
-    data["protein", "binds_activity", "drug"].edge_index = combined_ei[:, unique_idx]
-    data["protein", "binds_activity", "drug"].edge_label = combined_y[unique_idx]
-    return data
 
 
 def sample_replay_batch(loader, current_protein_idx, replay_edges_per_protein=256, max_replay_proteins=1):
@@ -78,14 +56,19 @@ def main():
     print("📦 Loading final_graph_data_not_normalized.pt...")
     data = torch.load("data/final_graph_data_not_normalized.pt", weights_only=False).to(device)
     print("🧬 Merging pIC50, pKi, and pKd into a single pActivity metric...")
-    data = create_pactivity_edges(data)
+    data = merge_activity_edges(data, reduce="amax")
 
     prot_dim = data["protein"].x.size(1)
     drug_dim = data["drug"].x.size(1)
     lr = 5e-4
     elbo_weight = 0.1
 
-    loader = MultiplexPillarSampler(data, binds_metric="binds_activity", priors_cache_path="data/multiplex_priors.pt")
+    loader = MultiplexPillarSampler(
+        data,
+        binds_metric="binds_activity",
+        priors_cache_path="data/multiplex_priors.pt",
+        history_mode="empty",
+    )
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15)
     print(f"🧬 Stream built: {len(episodes)} protein episodes ready.")
 
@@ -109,12 +92,6 @@ def main():
     os.makedirs("models", exist_ok=True)
 
     episode_log = []
-    loader.binds_ei = torch.empty((2, 0), dtype=torch.long, device=device)
-    loader.binds_y = torch.empty((0,), dtype=torch.float, device=device)
-    loader.binds_w = torch.empty((0,), dtype=torch.float, device=device)
-    loader.edge_birth_t = torch.empty((0,), dtype=torch.float, device=device)
-    loader._refresh_bind_sorted_index()
-
     support_batch_size = 128
     replay_weight = 0.25
 

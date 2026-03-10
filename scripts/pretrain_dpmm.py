@@ -23,6 +23,7 @@ import pyro
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import PyroLRScheduler
 
+from src.data.binds_activity import merge_activity_edges
 from src.models.routing import BayesianMultiplexRouter
 from src.data.multiplex_loader import MultiplexPillarSampler
 
@@ -180,22 +181,7 @@ def main():
     data = torch.load(args.data, weights_only=False).to(device)
 
     print("Merging binding edge types (pic50, pki, pkd) → binds_activity (max per protein-drug pair)...")
-    metrics = ["binds_pic50", "binds_pki", "binds_pkd"]
-    all_ei, all_y = [], []
-    for m in metrics:
-        store = data["protein", m, "drug"]
-        all_ei.append(store.edge_index)
-        all_y.append(store.edge_label)
-    ei_cat = torch.cat(all_ei, dim=1)   # [2, E_total]
-    y_cat = torch.cat(all_y, dim=0)     # [E_total]
-    num_drugs = data["drug"].x.size(0)
-    pair_key = ei_cat[0] * num_drugs + ei_cat[1]
-    uniq_keys, inv = torch.unique(pair_key, return_inverse=True)
-    y_max = torch.full((uniq_keys.size(0),), float("-inf"), device=y_cat.device)
-    y_max.scatter_reduce_(0, inv, y_cat.float(), reduce="amax", include_self=True)
-    ei_merged = torch.stack([uniq_keys // num_drugs, uniq_keys % num_drugs], dim=0)
-    data["protein", "binds_activity", "drug"].edge_index = ei_merged
-    data["protein", "binds_activity", "drug"].edge_label = y_max
+    data = merge_activity_edges(data, reduce="amax")
 
     print(f"Building pillar sampler (priors: {args.priors})...")
     loader = MultiplexPillarSampler(data, binds_metric="binds_activity", priors_cache_path=args.priors)

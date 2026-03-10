@@ -150,6 +150,31 @@ class BindingEncoder(nn.Module):
         return self.net(torch.cat([protein, drug], dim=-1)).squeeze(-1)
 
 
+class BindingOnlyAffinityModel(nn.Module):
+    """Direct protein-drug baseline with a global affinity anchor and scalar sigma."""
+
+    def __init__(self, protein_dim: int, drug_dim: int, hidden: int = 512):
+        super().__init__()
+        self.binding_encoder = BindingEncoder(protein_dim, drug_dim, hidden=hidden)
+        self.log_sigma = nn.Parameter(torch.zeros(1))
+        self.last_forward_stats = {}
+
+    def forward(
+        self,
+        qry_protein: torch.Tensor,
+        qry_drug: torch.Tensor,
+        global_mean_affinity: float = 6.5,
+    ):
+        binding_prior = self.binding_encoder(qry_protein, qry_drug)
+        mu = binding_prior + global_mean_affinity
+        sigma = F.softplus(self.log_sigma).expand_as(mu) + 1e-4
+        self.last_forward_stats = {
+            "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
+            "binding_prior_std": float(binding_prior.detach().std(unbiased=False).item()) if binding_prior.numel() > 1 else 0.0,
+        }
+        return mu, sigma
+
+
 class ProteinLigandTNP(nn.Module):
     """
     Graph-biased Transformer Neural Process for protein-ligand binding prediction.
@@ -227,6 +252,7 @@ class ProteinLigandTNP(nn.Module):
         # Unit 7: Direct binding encoder + projection into token space
         self.binding_encoder = BindingEncoder(protein_dim, drug_dim)
         self.prior_proj = nn.Linear(1, token_dim)
+        self.last_forward_stats = {}
 
     def _encode_context(
         self,
@@ -372,6 +398,13 @@ class ProteinLigandTNP(nn.Module):
         # Bias decays to zero as density → 1 (warm regime)
         log_sigma = log_sigma + self.cold_start_bias * (1.0 - density)
         sigma = F.softplus(log_sigma) + 1e-4
+        self.last_forward_stats = {
+            "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
+            "binding_prior_std": float(binding_prior.detach().std(unbiased=False).item()) if binding_prior.numel() > 1 else 0.0,
+            "log_ppr_alpha": float(self.layers[0].attn.log_ppr_alpha.detach().item()) if self.layers else 0.0,
+            "centroid_alpha": float(self.centroid_alpha.detach().item()),
+            "density": float(density),
+        }
 
         return mu, sigma
 
@@ -419,7 +452,7 @@ class ProteinLigandTNP(nn.Module):
         pq_go_flat   = pq_go_fp.reshape(N_qry * K, -1)   if pq_go_fp  is not None else None
 
         ctx_tokens = self._encode_context(pq_p_flat, pq_d_flat, pq_a_flat, pq_gnn_flat, pq_go_flat)
-        ctx_tokens = ctx_tokens.view(N_qry, K, -1)                    # [N_qry, K, D]
+        ctx_tokens = ctx_tokens.view(N_qry, K, self.token_dim)        # [N_qry, K, D]
         ctx_tokens = ctx_tokens + self.type_embed(
             torch.zeros(K, dtype=torch.long, device=device)
         ).unsqueeze(0)                                                 # broadcast over N_qry
@@ -456,6 +489,13 @@ class ProteinLigandTNP(nn.Module):
 
         log_sigma = log_sigma + self.cold_start_bias * (1.0 - density)
         sigma     = F.softplus(log_sigma) + 1e-4
+        self.last_forward_stats = {
+            "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
+            "binding_prior_std": float(binding_prior.detach().std(unbiased=False).item()) if binding_prior.numel() > 1 else 0.0,
+            "log_ppr_alpha": float(self.layers[0].attn.log_ppr_alpha.detach().item()) if self.layers else 0.0,
+            "centroid_alpha": float(self.centroid_alpha.detach().item()),
+            "density": float(density),
+        }
 
         return mu, sigma
 

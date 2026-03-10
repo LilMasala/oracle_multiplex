@@ -337,7 +337,7 @@ class TNPContextBuilder:
 
         if not prot_parts:
             # Cold-start: return zero context, anchor to global mean
-            K = per_query_k
+            K = 0
             return (
                 torch.zeros(N_qry, K, protein_dim, device=device),
                 torch.zeros(N_qry, K, drug_dim,    device=device),
@@ -346,6 +346,7 @@ class TNPContextBuilder:
                 torch.zeros(N_qry, K,               device=device),
                 None,
                 torch.full((N_qry,), self.global_mean_affinity, device=device),
+                None,
             )
 
         pool_protein  = torch.cat(prot_parts,  dim=0)
