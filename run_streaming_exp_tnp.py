@@ -113,6 +113,9 @@ def main():
     # episode_log will still measure zero-shot ranking performance on each protein.
 
     episode_log = []
+    ci_history  = []
+    ef10_history = []
+    ROLL = 50  # rolling window size
 
     for i, ep in enumerate(episodes):
         loader.begin_episode(i)
@@ -123,8 +126,14 @@ def main():
         model.eval()
         with torch.no_grad():
             mu_eval, sigma_eval = run_episode(model, builder, drug_features, pillar, ep.edges[1])
-        ci_val  = calculate_ci(ep.labels, mu_eval)
+        ci_val   = calculate_ci(ep.labels, mu_eval)
         ef10_val = calculate_ef_at_k(ep.labels, mu_eval, k=0.1)
+        mean_sigma = float(sigma_eval.mean().detach())
+
+        ci_history.append(ci_val)
+        ef10_history.append(ef10_val)
+        ci_roll   = float(sum(ci_history[-ROLL:])   / len(ci_history[-ROLL:]))
+        ef10_roll = float(sum(ef10_history[-ROLL:]) / len(ef10_history[-ROLL:]))
 
         # --- TRAINING ---
         model.train()
@@ -165,6 +174,9 @@ def main():
             "protein_idx": ep.protein_idx,
             "ci": ci_val,
             "ef10": ef10_val,
+            "ci_roll50": ci_roll,
+            "ef10_roll50": ef10_roll,
+            "mean_sigma": mean_sigma,
             "total_loss": train_loss,
             "nll": nll_val,
             "replay_loss": replay_loss_val,
@@ -175,8 +187,9 @@ def main():
         if i % 5 == 0:
             print(
                 f"ep {i:04d}/{len(episodes)} "
-                f"| CI: {ci_val:.3f} | EF10: {ef10_val:.2f} "
-                f"| nll: {nll_val:.3f} | loss: {train_loss:.3f} "
+                f"| CI: {ci_val:.3f} (roll50: {ci_roll:.3f}) "
+                f"| EF10: {ef10_val:.2f} (roll50: {ef10_roll:.2f}) "
+                f"| σ: {mean_sigma:.3f} | nll: {nll_val:.3f} "
                 f"| ctx: {n_ctx}"
             )
 
