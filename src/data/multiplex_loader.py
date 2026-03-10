@@ -44,11 +44,15 @@ class MultiplexPillarSampler:
 
     def _get_diffused_neighbors(self, target_idx):
         device = self.protein_x.device
+
+        # Always use direct form/role edges as the neighbor set.
+        # PPR scores are used as weights (attention bias), not as a filter.
+        mask_form = self.form_ei[0] == target_idx
+        mask_role = self.role_ei[0] == target_idx
+        form_neighbors = self.form_ei[1][mask_form]
+        role_neighbors = self.role_ei[1][mask_role]
+
         if self.priors is None:
-            mask_form = self.form_ei[0] == target_idx
-            mask_role = self.role_ei[0] == target_idx
-            form_neighbors = self.form_ei[1][mask_form]
-            role_neighbors = self.role_ei[1][mask_role]
             return (
                 form_neighbors,
                 torch.ones_like(form_neighbors, dtype=torch.float32),
@@ -56,18 +60,24 @@ class MultiplexPillarSampler:
                 torch.ones_like(role_neighbors, dtype=torch.float32),
             )
 
+        # Look up PPR scores for direct neighbors; default to 1e-4 if not in top-k.
         ppr_idx = self.priors["ppr_topk_indices"][target_idx].to(device)
         ppr_scores = self.priors["ppr_topk_scores"][target_idx].to(device)
         valid = ppr_idx >= 0
         ppr_idx = ppr_idx[valid]
         ppr_scores = ppr_scores[valid]
 
-        base = torch.full_like(ppr_idx, fill_value=target_idx * self.num_proteins)
-        pair_hash = base + ppr_idx
-        in_form = torch.isin(pair_hash, self.form_hash)
-        in_role = torch.isin(pair_hash, self.role_hash)
+        def lookup_ppr(neighbors):
+            if neighbors.numel() == 0 or ppr_idx.numel() == 0:
+                return torch.full((neighbors.numel(),), 1e-4, dtype=torch.float32, device=device)
+            matches = neighbors.unsqueeze(1) == ppr_idx.unsqueeze(0)  # [N_neigh, K]
+            found = matches.any(dim=1)
+            best_idx = matches.float().argmax(dim=1)
+            scores = torch.full((neighbors.numel(),), 1e-4, dtype=torch.float32, device=device)
+            scores[found] = ppr_scores[best_idx[found]]
+            return scores
 
-        return ppr_idx[in_form], ppr_scores[in_form], ppr_idx[in_role], ppr_scores[in_role]
+        return form_neighbors, lookup_ppr(form_neighbors), role_neighbors, lookup_ppr(role_neighbors)
 
     def _get_neighbor_binding_edges(self, neighbor_indices):
         if neighbor_indices.numel() == 0 or self.binds_ei.size(1) == 0:
