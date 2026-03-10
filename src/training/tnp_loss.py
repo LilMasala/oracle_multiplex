@@ -26,9 +26,12 @@ class TNPLoss(nn.Module):
         nll = 0.5 * math.log(2 * math.pi) + torch.log(sigma) + (labels - mu) ** 2 / (2 * sigma ** 2)
         nll_loss = nll.mean()
 
-        # ListNet ranking loss
-        target_probs = F.softmax(labels, dim=0)
-        log_pred_probs = F.log_softmax(mu, dim=0)
+        # ListNet ranking loss with temperature to prevent winner-takes-all collapse
+        # Raw pIC50s (5-9) produce very peaky softmax; T=2 gives meaningful gradients
+        # across the full ranked list rather than just the top-1
+        T = 2.0
+        target_probs = F.softmax(labels / T, dim=0)
+        log_pred_probs = F.log_softmax(mu / T, dim=0)
         listnet_loss = -(target_probs * log_pred_probs).sum()
 
         # Lambda-MART pairwise loss

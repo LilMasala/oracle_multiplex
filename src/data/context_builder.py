@@ -13,14 +13,14 @@ class TNPContextBuilder:
         self.min_affinity_weight = min_affinity_weight
 
     def _collect_layer(self, neighbor_indices, neighbor_features, diff_w,
-                       binds_ei, binds_y, binds_w, target_features):
-        """Extract (protein, drug, affinity, ppr, delta, trust) tuples from one layer."""
+                       binds_ei, binds_y, binds_w):
+        """Extract (protein, drug, affinity, ppr, trust) tuples from one layer."""
         if binds_ei.size(1) == 0 or neighbor_indices.numel() == 0:
-            return [], [], [], [], [], []
+            return [], [], [], [], []
 
         keep = binds_w >= self.min_affinity_weight
         if not keep.any():
-            return [], [], [], [], [], []
+            return [], [], [], [], []
 
         ei = binds_ei[:, keep]
         y  = binds_y[keep]
@@ -30,12 +30,12 @@ class TNPContextBuilder:
 
         valid = drug_idx < self.drug_features.size(0)
         if not valid.any():
-            return [], [], [], [], [], []
+            return [], [], [], [], []
         ei, y, w = ei[:, valid], y[valid], w[valid]
         drug_idx, prot_idx = drug_idx[valid], prot_idx[valid]
 
         prot_list, drug_list, aff_list = [], [], []
-        ppr_list, delta_list, trust_list = [], [], []
+        ppr_list, trust_list = [], []
 
         for k, nidx in enumerate(neighbor_indices.tolist()):
             mask = prot_idx == nidx
@@ -50,14 +50,10 @@ class TNPContextBuilder:
             ppr_val = diff_w[k].item() if diff_w.numel() > k else 1.0
             ppr_list.append(torch.full((n_edges,), ppr_val, device=binds_ei.device))
 
-            # Structural delta: target - neighbor, broadcast across edges
-            delta = (target_features - neighbor_features[k]).unsqueeze(0).expand(n_edges, -1)
-            delta_list.append(delta)
-
             # Trust = temporal-decay-weighted edge weight
             trust_list.append(w[mask])
 
-        return prot_list, drug_list, aff_list, ppr_list, delta_list, trust_list
+        return prot_list, drug_list, aff_list, ppr_list, trust_list
 
     def build_context(self, pillar: dict):
         """
@@ -68,17 +64,15 @@ class TNPContextBuilder:
             ctx_drug:     [N_ctx, drug_dim]
             ctx_affinity: [N_ctx, 1]
             ctx_ppr:      [N_ctx]   — PPR score of each context protein to target
-            ctx_delta:    [N_ctx, protein_dim] — target_features - neighbor_features
             ctx_trust:    [N_ctx]   — temporal-decay-weighted edge weight
         If no context available, returns zero-size tensors.
         """
         device = pillar["target_features"].device
         protein_dim = pillar["target_features"].size(0)
         drug_dim = self.drug_features.size(1)
-        target_features = pillar["target_features"]
 
         prot_parts, drug_parts, aff_parts = [], [], []
-        ppr_parts, delta_parts, trust_parts = [], [], []
+        ppr_parts, trust_parts = [], []
 
         for layer in ("form", "role"):
             neighbors = pillar[f"{layer}_neighbors"]
@@ -87,14 +81,13 @@ class TNPContextBuilder:
             ei        = pillar[f"{layer}_binds_ei"]
             y         = pillar[f"{layer}_binds_y"]
             w         = pillar[f"{layer}_binds_w"]
-            p, d, a, ppr, delta, trust = self._collect_layer(
-                neighbors, features, diff_w, ei, y, w, target_features
+            p, d, a, ppr, trust = self._collect_layer(
+                neighbors, features, diff_w, ei, y, w
             )
             prot_parts.extend(p)
             drug_parts.extend(d)
             aff_parts.extend(a)
             ppr_parts.extend(ppr)
-            delta_parts.extend(delta)
             trust_parts.extend(trust)
 
         if not prot_parts:
@@ -103,7 +96,6 @@ class TNPContextBuilder:
                 torch.zeros(0, drug_dim, device=device),
                 torch.zeros(0, 1, device=device),
                 torch.zeros(0, device=device),
-                torch.zeros(0, protein_dim, device=device),
                 torch.zeros(0, device=device),
             )
 
@@ -111,7 +103,6 @@ class TNPContextBuilder:
         ctx_drug     = torch.cat(drug_parts, dim=0).to(device)
         ctx_affinity = torch.cat(aff_parts,  dim=0)
         ctx_ppr      = torch.cat(ppr_parts,  dim=0)
-        ctx_delta    = torch.cat(delta_parts, dim=0)
         ctx_trust    = torch.cat(trust_parts, dim=0)
 
         N = ctx_protein.size(0)
@@ -123,10 +114,9 @@ class TNPContextBuilder:
             ctx_drug     = ctx_drug[idx]
             ctx_affinity = ctx_affinity[idx]
             ctx_ppr      = ctx_ppr[idx]
-            ctx_delta    = ctx_delta[idx]
             ctx_trust    = ctx_trust[idx]
 
-        return ctx_protein, ctx_drug, ctx_affinity, ctx_ppr, ctx_delta, ctx_trust
+        return ctx_protein, ctx_drug, ctx_affinity, ctx_ppr, ctx_trust
 
 
 if __name__ == "__main__":
@@ -153,13 +143,12 @@ if __name__ == "__main__":
         "ppr_centroid": torch.zeros(protein_dim),
     }
 
-    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_delta, ctx_trust = builder.build_context(pillar)
+    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust = builder.build_context(pillar)
     assert ctx_p.shape[1] == protein_dim
     assert ctx_d.shape[1] == 512
     assert ctx_a.shape[1] == 1
     N = ctx_p.shape[0]
     assert ctx_ppr.shape == (N,)
-    assert ctx_delta.shape == (N, protein_dim)
     assert ctx_trust.shape == (N,)
     assert ctx_p.shape[0] == ctx_d.shape[0] == ctx_a.shape[0]
     print(f"Context size: {N} — PASSED")

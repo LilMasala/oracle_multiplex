@@ -9,11 +9,11 @@ class GraphBiasedMHA(nn.Module):
     Multi-head self-attention with graph-structural additive logit biases
     and a multiplicative value gate for context tokens.
 
-    attn_logit(i → ctx_k) += alpha * log(ppr_k + ε) + delta_proj(delta_k)
+    attn_logit(i → ctx_k) += alpha * log(ppr_k + ε)
     v_ctx_k                *= sigmoid(trust_scale * trust_k)
     """
 
-    def __init__(self, token_dim: int, nhead: int, dropout: float = 0.1, protein_dim: int = 0):
+    def __init__(self, token_dim: int, nhead: int, dropout: float = 0.1):
         super().__init__()
         assert token_dim % nhead == 0
         self.nhead    = nhead
@@ -29,26 +29,11 @@ class GraphBiasedMHA(nn.Module):
         self.log_ppr_alpha = nn.Parameter(torch.ones(1) * 0.1)   # α in α·log(ppr)
         self.trust_scale   = nn.Parameter(torch.ones(1) * 0.1)   # s in sigmoid(s·decay)
 
-        # Learned projection from protein_dim delta → scalar bias per context token
-        # Upgraded to an MLP for non-linear deduction of structural feature spaces
-        if protein_dim > 0:
-            self.delta_proj = nn.Sequential(
-                nn.Linear(protein_dim, token_dim // 2),
-                nn.GELU(),
-                nn.Linear(token_dim // 2, 1)
-            )
-            # Initialize the final layer to small values to prevent initial logit explosion
-            nn.init.normal_(self.delta_proj[-1].weight, std=0.01)
-            nn.init.zeros_(self.delta_proj[-1].bias)
-        else:
-            self.delta_proj = None
-
     def forward(
         self,
         x: torch.Tensor,           # [1, N, D]
         n_ctx: int,
         ctx_ppr: torch.Tensor,     # [n_ctx]
-        ctx_delta: torch.Tensor,   # [n_ctx, protein_dim]
         ctx_trust: torch.Tensor,   # [n_ctx]
         attn_mask: torch.Tensor | None = None,  # [N, N] bool, True=blocked
     ) -> torch.Tensor:
@@ -75,13 +60,7 @@ class GraphBiasedMHA(nn.Module):
 
         # --- Graph bias: columns 0..n_ctx-1 (all rows attend to context tokens) ---
         if n_ctx > 0:
-            alpha = self.log_ppr_alpha
-            ppr_bias = alpha * torch.log(ctx_ppr.clamp(min=1e-8))  # [n_ctx]
-            if self.delta_proj is not None:
-                delta_bias = self.delta_proj(ctx_delta).squeeze(-1)  # [n_ctx]
-            else:
-                delta_bias = torch.zeros(n_ctx, device=x.device)
-            col_bias = ppr_bias + delta_bias                         # [n_ctx]
+            col_bias = self.log_ppr_alpha * torch.log(ctx_ppr.clamp(min=1e-8))  # [n_ctx]
             # Broadcast: [1, 1, 1, n_ctx] → added to all [batch, head, row] slices
             pad = torch.zeros(N - n_ctx, device=x.device)
             col_bias_full = torch.cat([col_bias, pad], dim=0)        # [N]
@@ -101,11 +80,11 @@ class GraphBiasedMHA(nn.Module):
 class GraphBiasedTransformerLayer(nn.Module):
     """Pre-norm transformer layer wrapping GraphBiasedMHA."""
 
-    def __init__(self, token_dim: int, nhead: int, dropout: float = 0.1, protein_dim: int = 0):
+    def __init__(self, token_dim: int, nhead: int, dropout: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(token_dim)
         self.norm2 = nn.LayerNorm(token_dim)
-        self.attn  = GraphBiasedMHA(token_dim, nhead, dropout=dropout, protein_dim=protein_dim)
+        self.attn  = GraphBiasedMHA(token_dim, nhead, dropout=dropout)
         self.ff    = nn.Sequential(
             nn.Linear(token_dim, token_dim * 2),
             nn.GELU(),
@@ -114,10 +93,10 @@ class GraphBiasedTransformerLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x, n_ctx, ctx_ppr, ctx_delta, ctx_trust, attn_mask=None):
+    def forward(self, x, n_ctx, ctx_ppr, ctx_trust, attn_mask=None):
         # Pre-norm self-attention
         h = self.norm1(x)
-        x = x + self.attn(h, n_ctx, ctx_ppr, ctx_delta, ctx_trust, attn_mask)
+        x = x + self.attn(h, n_ctx, ctx_ppr, ctx_trust, attn_mask)
         # Pre-norm feed-forward
         x = x + self.ff(self.norm2(x))
         return x
@@ -131,9 +110,8 @@ class ProteinLigandTNP(nn.Module):
     Query set:   (target_protein, drug) pairs to rank.
     Output:      (mu, sigma) predicted affinity distribution per query.
 
-    Attention incorporates three graph signals for context tokens:
+    Attention incorporates two graph signals for context tokens:
       - PPR score   → additive logit bias: α · log(ppr_k)
-      - Delta (structural diff) → additive logit bias: w_delta · delta_k
       - Trust/decay → multiplicative V gate: sigmoid(s · decay_k)
     """
 
@@ -163,9 +141,9 @@ class ProteinLigandTNP(nn.Module):
         # Type embedding: 0 = context token, 1 = query token
         self.type_embed = nn.Embedding(2, token_dim)
 
-        # Graph-biased transformer layers (share protein_dim for delta projection)
+        # Graph-biased transformer layers
         self.layers = nn.ModuleList([
-            GraphBiasedTransformerLayer(token_dim, nhead, dropout=dropout, protein_dim=protein_dim)
+            GraphBiasedTransformerLayer(token_dim, nhead, dropout=dropout)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(token_dim)
@@ -190,15 +168,19 @@ class ProteinLigandTNP(nn.Module):
 
     def _build_mask(self, n_ctx, n_qry, device):
         """
-        Attention mask: query tokens cannot attend to each other.
+        Attention mask: queries attend to context only (no qry→qry, no ctx→qry).
+        This keeps context representations query-independent.
         Shape [n_ctx + n_qry, n_ctx + n_qry], True = blocked.
         """
         N = n_ctx + n_qry
         mask = torch.zeros(N, N, dtype=torch.bool, device=device)
         if n_qry > 0:
+            # Block qry→qry (except self)
             mask[n_ctx:, n_ctx:] = True
             idx = torch.arange(n_ctx, N, device=device)
-            mask[idx, idx] = False  # each query attends to itself
+            mask[idx, idx] = False
+            # Block ctx→qry so context representations stay query-independent
+            mask[:n_ctx, n_ctx:] = True
         return mask
 
     def forward(
@@ -209,7 +191,6 @@ class ProteinLigandTNP(nn.Module):
         qry_protein: torch.Tensor,     # [N_qry, protein_dim]
         qry_drug: torch.Tensor,        # [N_qry, drug_dim]
         ctx_ppr: torch.Tensor | None = None,    # [N_ctx]
-        ctx_delta: torch.Tensor | None = None,  # [N_ctx, protein_dim]
         ctx_trust: torch.Tensor | None = None,  # [N_ctx]
     ):
         device  = qry_protein.device
@@ -232,20 +213,16 @@ class ProteinLigandTNP(nn.Module):
             # Default graph signals if not provided
             if ctx_ppr is None:
                 ctx_ppr = torch.ones(n_ctx, device=device)
-            if ctx_delta is None:
-                ctx_delta = torch.zeros(n_ctx, ctx_protein.size(1), device=device)
             if ctx_trust is None:
                 ctx_trust = torch.ones(n_ctx, device=device)
         else:
             tokens    = qry_tokens.unsqueeze(0)
             mask      = None
             ctx_ppr   = torch.zeros(0, device=device)
-            ctx_delta = torch.zeros(0, ctx_protein.size(1) if ctx_protein.size(1) > 0
-                                    else qry_protein.size(1), device=device)
             ctx_trust = torch.zeros(0, device=device)
 
         for layer in self.layers:
-            tokens = layer(tokens, n_ctx, ctx_ppr, ctx_delta, ctx_trust, attn_mask=mask)
+            tokens = layer(tokens, n_ctx, ctx_ppr, ctx_trust, attn_mask=mask)
         tokens = self.final_norm(tokens).squeeze(0)    # [N, D]
 
         qry_out = tokens[n_ctx:]                       # [N_qry, D]
@@ -265,14 +242,13 @@ if __name__ == "__main__":
     ctx_drug     = torch.randn(10, drug_dim)
     ctx_affinity = torch.randn(10, 1)
     ctx_ppr      = torch.rand(10).clamp(1e-6, 1.0)
-    ctx_delta    = torch.randn(10, prot_dim)
     ctx_trust    = torch.rand(10)
     qry_protein  = torch.randn(50, prot_dim)
     qry_drug     = torch.randn(50, drug_dim)
 
     mu, sigma = model(ctx_protein, ctx_drug, ctx_affinity,
                       qry_protein, qry_drug,
-                      ctx_ppr, ctx_delta, ctx_trust)
+                      ctx_ppr, ctx_trust)
     assert mu.shape == (50,), f"Expected (50,), got {mu.shape}"
     assert sigma.shape == (50,)
     assert (sigma > 0).all()

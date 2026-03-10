@@ -59,12 +59,12 @@ def sample_replay_batch(loader, current_protein_idx, replay_edges_per_protein=25
 
 def run_episode(model, builder, drug_features, pillar, query_drug_indices):
     """Forward pass for one protein episode. Returns (mu, sigma)."""
-    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_delta, ctx_trust = builder.build_context(pillar)
+    ctx_p, ctx_d, ctx_a, ctx_ppr, ctx_trust = builder.build_context(pillar)
     target = pillar["target_features"]
     n_q = query_drug_indices.size(0)
     qry_protein = target.unsqueeze(0).expand(n_q, -1)
     qry_drug = drug_features[query_drug_indices]
-    return model(ctx_p, ctx_d, ctx_a, qry_protein, qry_drug, ctx_ppr, ctx_delta, ctx_trust)
+    return model(ctx_p, ctx_d, ctx_a, qry_protein, qry_drug, ctx_ppr, ctx_trust)
 
 
 def main():
@@ -72,7 +72,7 @@ def main():
     parser.add_argument("--data", default="data/final_graph_data_not_normalized.pt")
     parser.add_argument("--priors", default="data/multiplex_priors.pt")
     parser.add_argument("--n-episodes", type=int, default=None, help="Limit number of episodes (default: all)")
-    parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--token-dim", type=int, default=256)
     parser.add_argument("--max-context", type=int, default=256)
     parser.add_argument("--replay-weight", type=float, default=0.5)
@@ -99,8 +99,10 @@ def main():
 
     builder = TNPContextBuilder(drug_features, max_context=args.max_context)
     model = ProteinLigandTNP(prot_dim, drug_dim, token_dim=args.token_dim).to(device)
-    loss_fn =  TNPLoss()
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    loss_fn = TNPLoss().to(device) # <-- Add .to(device) here
+    
+    # <-- Pass BOTH model and loss parameters to Adam
+    optimizer = Adam(list(model.parameters()) + list(loss_fn.parameters()), lr=args.lr)
 
     print("\nSTARTING TNP PREQUENTIAL STREAM")
     print("-" * 70)
