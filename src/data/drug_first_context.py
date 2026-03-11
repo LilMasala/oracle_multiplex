@@ -156,6 +156,7 @@ class DrugFirstContextBuilder:
         ctx_affinities: torch.Tensor,      # [n_qry, K]               modified in-place
         ctx_mask: torch.Tensor,            # [n_qry, K]               modified in-place
         device: torch.device,
+        max_pool: int = 512,               # cap neighbourhood pool before similarity search
     ):
         """
         Level 3: for queries still lacking context after levels 1-2, fall back to
@@ -191,8 +192,16 @@ class DrugFirstContextBuilder:
 
         pool_prot_idxs = torch.cat(pool_prot_idxs)
         pool_drug_idxs = torch.cat(pool_drug_idxs)
-        pool_affs = torch.cat(pool_affs).to(device)
+        pool_affs = torch.cat(pool_affs)
 
+        # Cap pool size to avoid O(n_qry × pool) memory blow-up
+        if pool_prot_idxs.size(0) > max_pool:
+            perm = torch.randperm(pool_prot_idxs.size(0))[:max_pool]
+            pool_prot_idxs = pool_prot_idxs[perm]
+            pool_drug_idxs = pool_drug_idxs[perm]
+            pool_affs = pool_affs[perm]
+
+        pool_affs = pool_affs.to(device)
         pool_prot_feats = self.protein_features[pool_prot_idxs].to(device)
         pool_drug_feats = self.drug_features[pool_drug_idxs].to(device)
 
