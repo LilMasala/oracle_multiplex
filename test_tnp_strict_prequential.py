@@ -4,10 +4,12 @@ import torch
 from torch_geometric.data import HeteroData
 
 from diagnostic_attention import run_diagnostic
+from run_streaming_exp_tnp import split_stream_episodes
 from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.models.neighbor_transfer import NeighborTransferModel
+from src.protocol.prequential import ProteinEpisode
 from src.training.cold_start_metrics import classify_regime
 
 
@@ -48,6 +50,15 @@ class StrictPrequentialTests(unittest.TestCase):
         self.assertEqual(pillar["form_binds_ei"].size(1), 0)
         self.assertEqual(pillar["role_binds_ei"].size(1), 0)
 
+    def test_stream_split_partitions_historical_prefix(self):
+        episodes = [ProteinEpisode(t=i, protein_idx=i, edges=torch.zeros((2, 0), dtype=torch.long), labels=torch.zeros(0)) for i in range(10)]
+        historical, stream = split_stream_episodes(episodes, 0.5)
+
+        self.assertEqual(len(historical), 5)
+        self.assertEqual(len(stream), 5)
+        self.assertEqual([ep.protein_idx for ep in historical], [0, 1, 2, 3, 4])
+        self.assertEqual([ep.protein_idx for ep in stream], [5, 6, 7, 8, 9])
+
     def test_add_revealed_edges_deduplicates_pairs(self):
         data = make_test_graph()
         loader = MultiplexPillarSampler(data, history_mode="empty")
@@ -61,6 +72,24 @@ class StrictPrequentialTests(unittest.TestCase):
         self.assertEqual(stats["revealed_edge_count"], 4)
         self.assertEqual(stats["unique_revealed_edge_count"], 4)
         self.assertEqual(stats["duplicate_revealed_edges"], 2)
+
+    def test_historical_seed_populates_stream_context_without_target_leakage(self):
+        data = make_test_graph()
+        loader = MultiplexPillarSampler(data, history_mode="empty")
+        edge_index = data["protein", "binds_pic50", "drug"].edge_index
+        edge_label = data["protein", "binds_pic50", "drug"].edge_label
+
+        hist_mask = edge_index[0] == 0
+        loader.begin_episode(0)
+        loader.add_revealed_edges(edge_index[:, hist_mask], edge_label[hist_mask])
+
+        stats = loader.history_stats()
+        self.assertEqual(stats["revealed_edge_count"], int(hist_mask.sum().item()))
+
+        loader.begin_episode(1)
+        pillar = loader.get_pillar_context(1)
+        self.assertGreater(pillar["form_binds_ei"].size(1), 0)
+        self.assertTrue(torch.all(pillar["form_binds_ei"][0] == 0))
 
     def test_merge_activity_edges_uses_amax(self):
         data = HeteroData()

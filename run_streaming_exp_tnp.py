@@ -100,6 +100,21 @@ def sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein
     return replay_batches
 
 
+def split_stream_episodes(episodes, historical_frac: float):
+    """Split a shuffled protein stream into historical and streamed episodes."""
+    if historical_frac <= 0.0:
+        return [], episodes
+    if historical_frac >= 1.0:
+        raise ValueError("historical_protein_frac must be < 1.0 so at least one streamed protein remains")
+
+    historical_count = int(len(episodes) * historical_frac)
+    if historical_count <= 0:
+        return [], episodes
+    if historical_count >= len(episodes):
+        raise ValueError("historical_protein_frac leaves no streamed proteins")
+    return episodes[:historical_count], episodes[historical_count:]
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Strict TNP prequential streaming experiment")
     parser.add_argument("--data", default="data/final_graph_data_not_normalized.pt")
@@ -133,6 +148,12 @@ def build_arg_parser():
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
     parser.add_argument("--binding-warmstart", default=None, help="Optional binding-encoder checkpoint")
     parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
+    parser.add_argument(
+        "--historical-protein-frac",
+        type=float,
+        default=0.0,
+        help="Protein-disjoint fraction consumed before the streamed evaluation and used to seed history",
+    )
     return parser
 
 
@@ -160,6 +181,13 @@ def apply_presets(args):
         print(f"Ignoring per_query_k={args.per_query_k} for model_kind={args.model_kind}")
         args.per_query_k = 0
 
+    if args.historical_protein_frac > 0 and args.history_mode != "empty":
+        print(
+            f"Using history_mode=empty because historical_protein_frac={args.historical_protein_frac} "
+            "already seeds history explicitly."
+        )
+        args.history_mode = "empty"
+
     return args
 
 
@@ -171,6 +199,8 @@ def default_run_name(args):
         parts.append(f"pq{args.per_query_k}")
     if args.model_kind == "neighbor-transfer":
         parts.append(f"nk{args.neighbor_k}")
+    if args.historical_protein_frac > 0:
+        parts.append(f"hist{int(round(args.historical_protein_frac * 100))}")
     if args.enable_synthetic_prior:
         parts.append("syn")
     if args.use_go:
@@ -321,6 +351,87 @@ def collect_forward_stats(model):
     }
 
 
+def optimize_episode(
+    args,
+    model,
+    loss_fn,
+    optimizer,
+    builder,
+    drug_features,
+    pillar,
+    query_drug_indices,
+    labels,
+    replay_buffer,
+    loader,
+    gnn_runtime,
+    global_mean_affinity,
+    total_episodes,
+    episode_idx,
+):
+    train_loss = float("nan")
+    nll_val = float("nan")
+    replay_loss_val = float("nan")
+    w_nll = float("nan")
+    w_listnet = float("nan")
+    w_lambda = float("nan")
+
+    if optimizer is None or loss_fn is None:
+        return train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda
+
+    model.train()
+    loss_fn.train()
+    optimizer.zero_grad()
+    loss_fn.step_schedule(episode_idx, total_episodes)
+
+    mu_train, sigma_train, _ = run_episode(
+        args,
+        model,
+        builder,
+        drug_features,
+        pillar,
+        query_drug_indices,
+        gnn_runtime=gnn_runtime,
+        global_mean_affinity=global_mean_affinity,
+    )
+    train_result = loss_fn(mu_train, sigma_train, labels.to(query_drug_indices.device))
+    train_result["total_loss"].backward()
+
+    train_loss = float(train_result["total_loss"].detach())
+    nll_val = float(train_result["nll"].detach())
+    w_nll = float(train_result["w_nll"])
+    w_listnet = float(train_result["w_listnet"])
+    w_lambda = float(train_result["w_lambda"])
+
+    replay_protein_indices = replay_buffer.sample(25)
+    replay_batches = sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein=256)
+    if replay_batches:
+        replay_total = torch.tensor(0.0, device=query_drug_indices.device)
+        for _, replay_edges, replay_labels, replay_pillar in replay_batches:
+            replay_mu, replay_sigma, _ = run_episode(
+                args,
+                model,
+                builder,
+                drug_features,
+                replay_pillar,
+                replay_edges[1],
+                gnn_runtime=gnn_runtime,
+                global_mean_affinity=global_mean_affinity,
+            )
+            replay_result = loss_fn(replay_mu, replay_sigma, replay_labels.to(query_drug_indices.device))
+            replay_total = replay_total + replay_result["total_loss"]
+        replay_total = replay_total / len(replay_batches)
+        (args.replay_weight * replay_total).backward()
+        replay_loss_val = float(replay_total.detach())
+
+    clip_params = list(model.parameters()) + list(loss_fn.parameters())
+    if gnn_runtime is not None and gnn_runtime["mode"] == "trainable":
+        clip_params += list(gnn_runtime["model"].parameters())
+    torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+    optimizer.step()
+
+    return train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda
+
+
 def run_episode(
     args,
     model,
@@ -453,7 +564,15 @@ def main():
     episodes = build_multiplex_stream(data, binds_metric="binds_activity", min_edges=15, seed=args.seed)
     if args.n_episodes is not None:
         episodes = episodes[:args.n_episodes]
+    historical_episodes, stream_episodes = split_stream_episodes(episodes, args.historical_protein_frac)
     print(f"Stream: {len(episodes)} episodes")
+    if historical_episodes:
+        print(
+            f"  Historical seed split: {len(historical_episodes)} proteins ({args.historical_protein_frac:.0%})"
+            f" | streamed eval: {len(stream_episodes)} proteins"
+        )
+    else:
+        stream_episodes = episodes
 
     global_drug_mean = drug_features.mean(0)
     global_mean_affinity = float(data["protein", "binds_activity", "drug"].edge_label.mean())
@@ -487,7 +606,8 @@ def main():
     loss_fn = None if args.model_kind == "global-mean" else TNPLoss().to(device)
     optimizer = build_optimizer(args, model, loss_fn, gnn_runtime)
 
-    print("\nSTARTING STRICT PREQUENTIAL STREAM")
+    stream_title = "HISTORICAL-SEEDED PREQUENTIAL STREAM" if historical_episodes else "STARTING STRICT PREQUENTIAL STREAM"
+    print(f"\n{stream_title}")
     print(f"  run name:        {run_name}")
     print(f"  model kind:      {args.model_kind}")
     print(f"  history mode:    {args.history_mode}")
@@ -498,6 +618,7 @@ def main():
     print(f"  GO fingerprints: {args.use_go} (dim={go_fp_dim})")
     print(f"  per-query-k:     {args.per_query_k} {'(dynamic context)' if args.per_query_k > 0 else '(shared context)'}")
     print(f"  neighbor-k:      {args.neighbor_k}")
+    print(f"  historical frac: {args.historical_protein_frac:.0%}")
     print(f"  cold-start only: {args.cold_start_only}")
     print("-" * 72)
 
@@ -514,14 +635,66 @@ def main():
     regime_counts = {"cold": 0, "sparse": 0, "warm": 0}
     roll_window = 100
     train_scope_upgraded = False
+    total_episode_budget = len(historical_episodes) + len(stream_episodes)
 
-    for i, ep in enumerate(episodes):
-        loader.begin_episode(i)
+    if historical_episodes:
+        print("\nConsuming historical split before streamed evaluation...")
+        for hist_i, ep in enumerate(historical_episodes):
+            loader.begin_episode(hist_i)
+            if (
+                isinstance(model, ProteinLigandTNP)
+                and args.train_scope == "head-only"
+                and args.unfreeze_after is not None
+                and hist_i >= args.unfreeze_after
+                and not train_scope_upgraded
+            ):
+                set_tnp_train_scope(model, "full")
+                train_scope_upgraded = True
+                print(f"Historical episode {hist_i}: switching TNP train scope from head-only to full")
+
+            pillar = loader.get_pillar_context(ep.protein_idx)
+            optimize_episode(
+                args,
+                model,
+                loss_fn,
+                optimizer,
+                builder,
+                drug_features,
+                pillar,
+                ep.edges[1],
+                ep.labels,
+                replay_buffer,
+                loader,
+                gnn_runtime,
+                global_mean_affinity,
+                total_episode_budget,
+                hist_i,
+            )
+            loader.add_revealed_edges(ep.edges, ep.labels)
+            replay_buffer.add(ep.protein_idx, pillar["target_features"])
+
+            if hist_i % 100 == 0 or hist_i == len(historical_episodes) - 1:
+                hist_stats = loader.history_stats()
+                print(
+                    f"  hist {hist_i + 1:04d}/{len(historical_episodes)}"
+                    f" | seeded edges: {hist_stats['revealed_edge_count']}"
+                    f" | unique: {hist_stats['unique_revealed_edge_count']}"
+                )
+
+        seeded_stats = loader.history_stats()
+        print(
+            f"Historical split ready: seeded history has {seeded_stats['revealed_edge_count']} edges"
+            f" ({seeded_stats['unique_revealed_edge_count']} unique)"
+        )
+
+    for i, ep in enumerate(stream_episodes):
+        global_episode_idx = len(historical_episodes) + i
+        loader.begin_episode(global_episode_idx)
         if (
             isinstance(model, ProteinLigandTNP)
             and args.train_scope == "head-only"
             and args.unfreeze_after is not None
-            and i >= args.unfreeze_after
+            and global_episode_idx >= args.unfreeze_after
             and not train_scope_upgraded
         ):
             set_tnp_train_scope(model, "full")
@@ -547,7 +720,7 @@ def main():
         n_ctx = int(eval_stats["n_ctx"])
         regime = classify_regime(n_ctx)
         regime_counts[regime] += 1
-        if args.history_mode == "empty" and i == 0 and n_ctx != 0:
+        if args.history_mode == "empty" and not historical_episodes and i == 0 and n_ctx != 0:
             raise RuntimeError(
                 f"Episode 0 should be cold under strict history_mode=empty, but n_ctx={n_ctx}. "
                 "This indicates preloaded history leakage."
@@ -569,57 +742,23 @@ def main():
         w_listnet = float("nan")
         w_lambda = float("nan")
 
-        if optimizer is not None and loss_fn is not None:
-            model.train()
-            loss_fn.train()
-            optimizer.zero_grad()
-            loss_fn.step_schedule(i, len(episodes))
-
-            mu_train, sigma_train, _ = run_episode(
-                args,
-                model,
-                builder,
-                drug_features,
-                pillar,
-                ep.edges[1],
-                gnn_runtime=gnn_runtime,
-                global_mean_affinity=global_mean_affinity,
-            )
-            train_result = loss_fn(mu_train, sigma_train, ep.labels.to(device))
-            train_result["total_loss"].backward()
-
-            train_loss = float(train_result["total_loss"].detach())
-            nll_val = float(train_result["nll"].detach())
-            w_nll = float(train_result["w_nll"])
-            w_listnet = float(train_result["w_listnet"])
-            w_lambda = float(train_result["w_lambda"])
-
-            replay_protein_indices = replay_buffer.sample(25)
-            replay_batches = sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein=256)
-            if replay_batches:
-                replay_total = torch.tensor(0.0, device=device)
-                for _, replay_edges, replay_labels, replay_pillar in replay_batches:
-                    replay_mu, replay_sigma, _ = run_episode(
-                        args,
-                        model,
-                        builder,
-                        drug_features,
-                        replay_pillar,
-                        replay_edges[1],
-                        gnn_runtime=gnn_runtime,
-                        global_mean_affinity=global_mean_affinity,
-                    )
-                    replay_result = loss_fn(replay_mu, replay_sigma, replay_labels.to(device))
-                    replay_total = replay_total + replay_result["total_loss"]
-                replay_total = replay_total / len(replay_batches)
-                (args.replay_weight * replay_total).backward()
-                replay_loss_val = float(replay_total.detach())
-
-            clip_params = list(model.parameters()) + list(loss_fn.parameters())
-            if gnn_runtime is not None and gnn_runtime["mode"] == "trainable":
-                clip_params += list(gnn_runtime["model"].parameters())
-            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
-            optimizer.step()
+        train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(
+            args,
+            model,
+            loss_fn,
+            optimizer,
+            builder,
+            drug_features,
+            pillar,
+            ep.edges[1],
+            ep.labels,
+            replay_buffer,
+            loader,
+            gnn_runtime,
+            global_mean_affinity,
+            total_episode_budget,
+            global_episode_idx,
+        )
 
         loader.add_revealed_edges(ep.edges, ep.labels)
         replay_buffer.add(ep.protein_idx, pillar["target_features"])
@@ -661,7 +800,7 @@ def main():
 
         if i % 5 == 0:
             print(
-                f"ep {i:04d}/{len(episodes)} [{regime:6s}]"
+                f"ep {i:04d}/{len(stream_episodes)} [{regime:6s}]"
                 f" | CI: {ci_val:.3f} (roll100: {ci_roll:.3f})"
                 f" | σ: {mean_sigma:.3f}"
                 f" | n_ctx: {n_ctx}"
@@ -671,7 +810,7 @@ def main():
                 f" | binding_std: {eval_stats['binding_prior_std']:.3f}"
             )
 
-    if args.history_mode == "empty" and regime_counts["cold"] + regime_counts["sparse"] == 0:
+    if args.history_mode == "empty" and not historical_episodes and regime_counts["cold"] + regime_counts["sparse"] == 0:
         raise RuntimeError("Strict prequential run produced only warm episodes; expected cold/sparse regimes as leakage check.")
 
     if args.model_kind != "global-mean":
