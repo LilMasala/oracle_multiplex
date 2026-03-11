@@ -319,7 +319,9 @@ def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
     elif args.model_kind == "neighbor-transfer":
         model = NeighborTransferModel(prot_dim, drug_dim, go_fp_dim=go_fp_dim)
     elif args.model_kind == "gp":
-        model = GPAffinityModel(prot_dim, drug_dim, hidden_dim=args.token_dim, out_dim=args.token_dim // 2)
+        # --token-dim repurposed as encoder/attention hidden width for the GP model
+        hidden = args.token_dim
+        model = GPAffinityModel(prot_dim, drug_dim, hidden_dim=hidden, out_dim=hidden // 2)
     else:
         model = ProteinLigandTNP(
             prot_dim,
@@ -461,6 +463,9 @@ def run_episode_gp(
 
     ctx_proteins, ctx_affinities, ctx_mask = gp_builder.build_context(
         target_idx, query_drug_indices, device
+    )
+    gp_builder.apply_neighborhood_fallback(
+        pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device
     )
     mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, global_mean_affinity)
 
@@ -707,6 +712,7 @@ def main():
     if args.model_kind == "gp":
         gp_builder = DrugFirstContextBuilder(
             protein_features=data["protein"].x,
+            drug_features=drug_features,
             drug_analog_index=drug_analog_index,
             max_k=args.max_context,
             analog_min_sim=0.5,
