@@ -400,13 +400,14 @@ class TNPContextBuilder:
         pillar: dict,
         query_drug_indices: torch.Tensor,
         top_k: int = 8,
+        max_pool: int = 4096,
     ):
         """
-        Exact-drug neighbor transfer context.
+        Drug-similarity neighbor transfer context.
 
-        For each query drug, gather up to top_k revealed neighbor bindings for
-        that same drug, ranked by PPR × trust. Returns padded tensors plus a
-        boolean mask indicating which neighbor slots are valid.
+        For each query drug, gather up to top_k revealed neighbor bindings from
+        the local protein neighborhood, ranked by drug_similarity × PPR × trust.
+        Returns padded tensors plus a boolean mask indicating valid slots.
         """
         device = pillar["target_features"].device
         protein_dim = pillar["target_features"].size(0)
@@ -464,19 +465,33 @@ class TNPContextBuilder:
         pool_affinity = torch.cat(aff_parts, dim=0).squeeze(-1)
         pool_ppr = torch.cat(ppr_parts, dim=0)
         pool_trust = torch.cat(trust_parts, dim=0)
-        pool_didx = torch.cat(didx_parts, dim=0)
         pool_go_fp = torch.cat(go_fp_parts, dim=0) if go_fp_parts else None
+        P = pool_protein.size(0)
 
-        for q_pos, q_idx in enumerate(query_drug_indices.tolist()):
-            match = pool_didx == int(q_idx)
-            if not match.any():
+        if P > max_pool:
+            pool_weight = (pool_ppr * pool_trust.clamp(min=1e-8)).clamp(min=1e-8)
+            sample_idx = torch.multinomial(pool_weight, max_pool, replacement=False)
+            pool_protein = pool_protein[sample_idx]
+            pool_drug = pool_drug[sample_idx]
+            pool_affinity = pool_affinity[sample_idx]
+            pool_ppr = pool_ppr[sample_idx]
+            pool_trust = pool_trust[sample_idx]
+            if pool_go_fp is not None:
+                pool_go_fp = pool_go_fp[sample_idx]
+            P = max_pool
+
+        qry_feats = self.drug_features[query_drug_indices].to(device).float()
+        qry_norm = torch.nn.functional.normalize(qry_feats, dim=1)
+        pool_norm = torch.nn.functional.normalize(pool_drug.float(), dim=1)
+        drug_sims = (qry_norm @ pool_norm.T + 1.0) / 2.0                  # [N_qry, P]
+        base_scores = pool_ppr.unsqueeze(0) * pool_trust.unsqueeze(0).clamp(min=1e-8)
+        scores = drug_sims * base_scores
+
+        for q_pos in range(n_qry):
+            take = min(K, P)
+            if take == 0:
                 continue
-
-            matched_idx = torch.nonzero(match, as_tuple=False).squeeze(-1)
-            scores = pool_ppr[matched_idx] * pool_trust[matched_idx].clamp(min=1e-8)
-            take = min(K, matched_idx.numel())
-            top_idx = torch.topk(scores, k=take, largest=True).indices
-            chosen = matched_idx[top_idx]
+            chosen = torch.topk(scores[q_pos], k=take, largest=True).indices
 
             neighbor_protein[q_pos, :take] = pool_protein[chosen]
             neighbor_drug[q_pos, :take] = pool_drug[chosen]
@@ -484,7 +499,7 @@ class TNPContextBuilder:
             neighbor_ppr[q_pos, :take] = pool_ppr[chosen]
             neighbor_trust[q_pos, :take] = pool_trust[chosen]
             neighbor_mask[q_pos, :take] = True
-            matched_counts[q_pos] = matched_idx.numel()
+            matched_counts[q_pos] = take
             if neighbor_go_fp is not None and pool_go_fp is not None:
                 neighbor_go_fp[q_pos, :take] = pool_go_fp[chosen]
 

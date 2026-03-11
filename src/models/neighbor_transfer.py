@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.tnp import BindingEncoder
+
 
 class NeighborTransferModel(nn.Module):
     """
@@ -23,7 +25,7 @@ class NeighborTransferModel(nn.Module):
         super().__init__()
         self.go_fp_dim = go_fp_dim
 
-        feature_dim = protein_dim * 3 + drug_dim + 3
+        feature_dim = protein_dim * 3 + drug_dim * 3 + 4
         if go_fp_dim > 0:
             feature_dim += go_fp_dim * 3
 
@@ -41,6 +43,7 @@ class NeighborTransferModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        self.binding_encoder = BindingEncoder(protein_dim, drug_dim, hidden=hidden_dim)
         self.log_sigma = nn.Parameter(torch.zeros(1))
         self.last_forward_stats = {}
 
@@ -59,15 +62,20 @@ class NeighborTransferModel(nn.Module):
         qry_protein_exp = qry_protein.unsqueeze(1).expand(-1, K, -1)
         qry_drug_exp = qry_drug.unsqueeze(1).expand(-1, K, -1)
         protein_delta = qry_protein_exp - neighbor_protein
+        drug_delta = qry_drug_exp - neighbor_drug
+        drug_sim = F.cosine_similarity(qry_drug_exp, neighbor_drug, dim=-1).unsqueeze(-1)
 
         parts = [
             qry_protein_exp,
             neighbor_protein,
             protein_delta,
             qry_drug_exp,
+            neighbor_drug,
+            drug_delta,
             neighbor_affinity.unsqueeze(-1),
             neighbor_ppr.unsqueeze(-1),
             neighbor_trust.unsqueeze(-1),
+            drug_sim,
         ]
         if qry_go_fp is not None and neighbor_go_fp is not None and self.go_fp_dim > 0:
             qry_go_exp = qry_go_fp.unsqueeze(1).expand(-1, K, -1)
@@ -90,12 +98,11 @@ class NeighborTransferModel(nn.Module):
         neighbor_go_fp: torch.Tensor | None = None,  # [N_qry, K, go_dim]
         global_mean_affinity: float = 6.5,
     ):
-        del neighbor_drug  # exact-drug model: query drug already represents the pair
-
         features = self._build_features(
             qry_protein,
             qry_drug,
             neighbor_protein,
+            neighbor_drug,
             neighbor_affinity,
             neighbor_ppr,
             neighbor_trust,
@@ -113,22 +120,17 @@ class NeighborTransferModel(nn.Module):
         transfer = (weights * neighbor_affinity).sum(dim=1)
         delta = self.delta_net(features).squeeze(-1)
         correction = (weights * delta).sum(dim=1)
+        direct_prior = self.binding_encoder(qry_protein, qry_drug) + global_mean_affinity
 
         has_neighbors = neighbor_mask.any(dim=1)
-        fallback = torch.full(
-            (qry_protein.size(0),),
-            float(global_mean_affinity),
-            dtype=qry_protein.dtype,
-            device=qry_protein.device,
-        )
-        mu = torch.where(has_neighbors, transfer + correction, fallback)
+        mu = torch.where(has_neighbors, transfer + correction, direct_prior)
 
         base_sigma = F.softplus(self.log_sigma).expand_as(mu)
-        sigma = base_sigma + (~has_neighbors).float() * 0.25 + 1e-4
+        sigma = base_sigma + (~has_neighbors).float() * 0.15 + 1e-4
 
         self.last_forward_stats = {
             "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
-            "binding_prior_std": float(correction.detach().std(unbiased=False).item()) if correction.numel() > 1 else 0.0,
+            "binding_prior_std": float(direct_prior.detach().std(unbiased=False).item()) if direct_prior.numel() > 1 else 0.0,
             "log_ppr_alpha": 0.0,
             "centroid_alpha": 0.0,
             "density": float(neighbor_mask.float().sum(dim=1).mean().item()),
