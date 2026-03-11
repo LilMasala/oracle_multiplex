@@ -22,7 +22,9 @@ from torch.optim import Adam
 from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.diverse_replay_buffer import DiverseReplayBuffer
+from src.data.drug_first_context import DrugFirstContextBuilder
 from src.data.multiplex_loader import MultiplexPillarSampler
+from src.models.gp_affinity import GPAffinityModel
 from src.models.neighbor_transfer import NeighborTransferModel
 from src.models.tnp import BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
@@ -129,7 +131,7 @@ def build_arg_parser():
     parser.add_argument("--merge-reduce", choices=["amax", "mean"], default="amax")
     parser.add_argument(
         "--model-kind",
-        choices=["tnp", "binding-only", "global-mean", "neighbor-transfer"],
+        choices=["tnp", "binding-only", "global-mean", "neighbor-transfer", "gp"],
         default="tnp",
     )
     parser.add_argument("--history-mode", choices=["empty", "full"], default="empty")
@@ -179,6 +181,13 @@ def apply_presets(args):
 
     if args.model_kind != "tnp" and args.per_query_k != 0:
         print(f"Ignoring per_query_k={args.per_query_k} for model_kind={args.model_kind}")
+        args.per_query_k = 0
+
+    if args.model_kind == "gp":
+        # GP has its own drug-analog handling (level 2); disable TNP-specific features
+        args.gnn_mode = "off"
+        args.use_go = False
+        args.enable_synthetic_prior = False
         args.per_query_k = 0
 
     if args.historical_protein_frac > 0 and args.history_mode != "empty":
@@ -309,6 +318,8 @@ def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
         model = BindingOnlyAffinityModel(prot_dim, drug_dim)
     elif args.model_kind == "neighbor-transfer":
         model = NeighborTransferModel(prot_dim, drug_dim, go_fp_dim=go_fp_dim)
+    elif args.model_kind == "gp":
+        model = GPAffinityModel(prot_dim, drug_dim, hidden_dim=args.token_dim, out_dim=args.token_dim // 2)
     else:
         model = ProteinLigandTNP(
             prot_dim,
@@ -427,6 +438,92 @@ def optimize_episode(
     if gnn_runtime is not None and gnn_runtime["mode"] == "trainable":
         clip_params += list(gnn_runtime["model"].parameters())
     torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+    optimizer.step()
+
+    return train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda
+
+
+def run_episode_gp(
+    model: GPAffinityModel,
+    gp_builder: DrugFirstContextBuilder,
+    drug_features: torch.Tensor,
+    pillar: dict,
+    query_drug_indices: torch.Tensor,
+    global_mean_affinity: float = 6.5,
+):
+    target = pillar["target_features"]
+    target_idx = int(pillar["target_idx"])
+    n_qry = query_drug_indices.size(0)
+    device = query_drug_indices.device
+
+    qry_protein = target.unsqueeze(0).expand(n_qry, -1)
+    qry_drug = drug_features[query_drug_indices]
+
+    ctx_proteins, ctx_affinities, ctx_mask = gp_builder.build_context(
+        target_idx, query_drug_indices, device
+    )
+    mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, global_mean_affinity)
+
+    stats = collect_forward_stats(model)
+    stats["n_ctx"] = int(ctx_mask.float().sum(dim=1).mean().item())
+    return mu, sigma, stats
+
+
+def optimize_episode_gp(
+    model: GPAffinityModel,
+    loss_fn,
+    optimizer,
+    gp_builder: DrugFirstContextBuilder,
+    drug_features: torch.Tensor,
+    pillar: dict,
+    query_drug_indices: torch.Tensor,
+    labels: torch.Tensor,
+    replay_buffer,
+    loader,
+    global_mean_affinity: float,
+    replay_weight: float,
+    episode_idx: int,
+    total_episodes: int,
+    replay_edges_per_protein: int = 256,
+):
+    train_loss = nll_val = replay_loss_val = float("nan")
+    w_nll = w_listnet = w_lambda = float("nan")
+
+    if optimizer is None or loss_fn is None:
+        return train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda
+
+    model.train()
+    loss_fn.train()
+    optimizer.zero_grad()
+    loss_fn.step_schedule(episode_idx, total_episodes)
+
+    mu, sigma, _ = run_episode_gp(
+        model, gp_builder, drug_features, pillar, query_drug_indices, global_mean_affinity
+    )
+    result = loss_fn(mu, sigma, labels.to(query_drug_indices.device))
+    result["total_loss"].backward()
+
+    train_loss = float(result["total_loss"].detach())
+    nll_val = float(result["nll"].detach())
+    w_nll = float(result["w_nll"])
+    w_listnet = float(result["w_listnet"])
+    w_lambda = float(result["w_lambda"])
+
+    replay_protein_indices = replay_buffer.sample(25)
+    replay_batches = sample_replay_batch(loader, replay_protein_indices, replay_edges_per_protein)
+    if replay_batches:
+        replay_total = torch.tensor(0.0, device=query_drug_indices.device)
+        for _, replay_edges, replay_labels, replay_pillar in replay_batches:
+            r_mu, r_sigma, _ = run_episode_gp(
+                model, gp_builder, drug_features, replay_pillar, replay_edges[1], global_mean_affinity
+            )
+            r_result = loss_fn(r_mu, r_sigma, replay_labels.to(query_drug_indices.device))
+            replay_total = replay_total + r_result["total_loss"]
+        replay_total = replay_total / len(replay_batches)
+        (replay_weight * replay_total).backward()
+        replay_loss_val = float(replay_total.detach())
+
+    torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(loss_fn.parameters()), 1.0)
     optimizer.step()
 
     return train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda
@@ -606,6 +703,15 @@ def main():
     loss_fn = None if args.model_kind == "global-mean" else TNPLoss().to(device)
     optimizer = build_optimizer(args, model, loss_fn, gnn_runtime)
 
+    gp_builder = None
+    if args.model_kind == "gp":
+        gp_builder = DrugFirstContextBuilder(
+            protein_features=data["protein"].x,
+            drug_analog_index=drug_analog_index,
+            max_k=args.max_context,
+            analog_min_sim=0.5,
+        )
+
     stream_title = "HISTORICAL-SEEDED PREQUENTIAL STREAM" if historical_episodes else "STARTING STRICT PREQUENTIAL STREAM"
     print(f"\n{stream_title}")
     print(f"  run name:        {run_name}")
@@ -653,24 +759,21 @@ def main():
                 print(f"Historical episode {hist_i}: switching TNP train scope from head-only to full")
 
             pillar = loader.get_pillar_context(ep.protein_idx)
-            optimize_episode(
-                args,
-                model,
-                loss_fn,
-                optimizer,
-                builder,
-                drug_features,
-                pillar,
-                ep.edges[1],
-                ep.labels,
-                replay_buffer,
-                loader,
-                gnn_runtime,
-                global_mean_affinity,
-                total_episode_budget,
-                hist_i,
-            )
+            if gp_builder is not None:
+                optimize_episode_gp(
+                    model, loss_fn, optimizer, gp_builder, drug_features,
+                    pillar, ep.edges[1], ep.labels, replay_buffer, loader,
+                    global_mean_affinity, args.replay_weight, hist_i, total_episode_budget,
+                )
+            else:
+                optimize_episode(
+                    args, model, loss_fn, optimizer, builder, drug_features,
+                    pillar, ep.edges[1], ep.labels, replay_buffer, loader,
+                    gnn_runtime, global_mean_affinity, total_episode_budget, hist_i,
+                )
             loader.add_revealed_edges(ep.edges, ep.labels)
+            if gp_builder is not None:
+                gp_builder.add_revealed(ep.edges, ep.labels)
             replay_buffer.add(ep.protein_idx, pillar["target_features"])
 
             if hist_i % 100 == 0 or hist_i == len(historical_episodes) - 1:
@@ -706,16 +809,15 @@ def main():
 
         model.eval()
         with torch.no_grad():
-            mu_eval, sigma_eval, eval_stats = run_episode(
-                args,
-                model,
-                builder,
-                drug_features,
-                pillar,
-                ep.edges[1],
-                gnn_runtime=gnn_runtime,
-                global_mean_affinity=global_mean_affinity,
-            )
+            if gp_builder is not None:
+                mu_eval, sigma_eval, eval_stats = run_episode_gp(
+                    model, gp_builder, drug_features, pillar, ep.edges[1], global_mean_affinity,
+                )
+            else:
+                mu_eval, sigma_eval, eval_stats = run_episode(
+                    args, model, builder, drug_features, pillar, ep.edges[1],
+                    gnn_runtime=gnn_runtime, global_mean_affinity=global_mean_affinity,
+                )
 
         n_ctx = int(eval_stats["n_ctx"])
         regime = classify_regime(n_ctx)
@@ -742,25 +844,22 @@ def main():
         w_listnet = float("nan")
         w_lambda = float("nan")
 
-        train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(
-            args,
-            model,
-            loss_fn,
-            optimizer,
-            builder,
-            drug_features,
-            pillar,
-            ep.edges[1],
-            ep.labels,
-            replay_buffer,
-            loader,
-            gnn_runtime,
-            global_mean_affinity,
-            total_episode_budget,
-            global_episode_idx,
-        )
+        if gp_builder is not None:
+            train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode_gp(
+                model, loss_fn, optimizer, gp_builder, drug_features,
+                pillar, ep.edges[1], ep.labels, replay_buffer, loader,
+                global_mean_affinity, args.replay_weight, global_episode_idx, total_episode_budget,
+            )
+        else:
+            train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(
+                args, model, loss_fn, optimizer, builder, drug_features,
+                pillar, ep.edges[1], ep.labels, replay_buffer, loader,
+                gnn_runtime, global_mean_affinity, total_episode_budget, global_episode_idx,
+            )
 
         loader.add_revealed_edges(ep.edges, ep.labels)
+        if gp_builder is not None:
+            gp_builder.add_revealed(ep.edges, ep.labels)
         replay_buffer.add(ep.protein_idx, pillar["target_features"])
         history_after = loader.history_stats()
 
