@@ -52,6 +52,7 @@ class NeighborTransferModel(nn.Module):
         qry_protein: torch.Tensor,
         qry_drug: torch.Tensor,
         neighbor_protein: torch.Tensor,
+        neighbor_drug: torch.Tensor,
         neighbor_affinity: torch.Tensor,
         neighbor_ppr: torch.Tensor,
         neighbor_trust: torch.Tensor,
