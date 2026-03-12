@@ -262,6 +262,7 @@ def build_arg_parser():
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
     parser.add_argument("--resume-from", default=None, help="Resume from a prequential checkpoint saved by --checkpoint-every")
     parser.add_argument("--checkpoint-every", type=int, default=100, help="Save a resumable checkpoint every N stream episodes (0 = disabled)")
+    parser.add_argument("--checkpoint-path", default=None, help="Override default checkpoint path (default: models/{run_name}_ckpt.pt)")
     parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
     parser.add_argument(
         "--historical-protein-frac",
@@ -905,7 +906,7 @@ def main():
     model_path = os.path.join("models", f"{run_name}.pt")
     results_path = os.path.join("results", f"{run_name}.csv")
     summary_path = os.path.join("results", f"{run_name}_cold_start_summary.csv")
-    checkpoint_path = os.path.join("models", f"{run_name}_ckpt.pt")
+    checkpoint_path = args.checkpoint_path or os.path.join("models", f"{run_name}_ckpt.pt")
 
     episode_log = []
     ci_history = []
