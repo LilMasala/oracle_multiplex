@@ -174,6 +174,9 @@ class GPAffinityModel(nn.Module):
         device = qry_protein.device
         has_ctx = ctx_mask.any(dim=1)  # [n_qry]
 
+        if prior is None:
+            prior = torch.zeros(n_qry, device=device)
+
         # Drug-conditional query encoding (deep kernel)
         Q = self.encoder(qry_protein, qry_drug)  # [n_qry, out_dim]
 
