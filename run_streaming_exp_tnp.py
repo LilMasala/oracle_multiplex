@@ -148,7 +148,6 @@ def build_arg_parser():
     parser.add_argument("--train-scope", choices=["full", "head-only"], default="full")
     parser.add_argument("--unfreeze-after", type=int, default=None, help="Episode index at which TNP switches from head-only to full")
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
-    parser.add_argument("--binding-warmstart", default=None, help="Optional binding-encoder checkpoint")
     parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
     parser.add_argument(
         "--historical-protein-frac",
@@ -240,30 +239,6 @@ def set_tnp_train_scope(model, scope: str):
     model.cold_start_bias.requires_grad = True
 
 
-def maybe_load_binding_warmstart(model, path, device):
-    if path is None or not hasattr(model, "binding_encoder"):
-        return
-
-    state = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    binding_state = {}
-    if isinstance(state, dict):
-        for key, value in state.items():
-            if key.startswith("binding_encoder."):
-                binding_state[key.split("binding_encoder.", 1)[1]] = value
-
-    if not binding_state and isinstance(state, dict):
-        binding_state = {k: v for k, v in state.items() if k.startswith("net.")}
-
-    if not binding_state:
-        raise ValueError(f"No binding_encoder weights found in {path}")
-
-    missing, unexpected = model.binding_encoder.load_state_dict(binding_state, strict=False)
-    print(f"Loaded binding warmstart from {path} | missing={len(missing)} unexpected={len(unexpected)}")
-
-
 def maybe_load_model_warmstart(model, path, device):
     if path is None:
         return
@@ -333,7 +308,6 @@ def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
 
     model = model.to(device)
     maybe_load_model_warmstart(model, args.warmstart_checkpoint, device)
-    maybe_load_binding_warmstart(model, args.binding_warmstart, device)
     set_tnp_train_scope(model, args.train_scope)
     return model
 

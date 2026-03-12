@@ -4,25 +4,25 @@ GP-inspired affinity model with drug-conditioned deep kernel learning.
 Architecture:
   DrugConditionalEncoder  f(protein, drug) → embedding  (the deep kernel)
   CrossAttentionLayer     query protein attends to context proteins, drug-conditionally
-  GPAffinityModel         GP transfer + correction head + BindingEncoder fallback
+  GPAffinityModel         GP transfer + correction head; prior supplied by caller
 
 Inference cascade:
   Level 1: D's exact binding profile {(protX, affinity)}
   Level 2: D' analog profiles {(protX, affinity × drug_sim)}, D' ~ D
-  Level 3: no context → BindingEncoder MLP fallback
+  Level 3: no context → caller-supplied prior (frozen BindingEncoder output + global mean)
 
 The cross-attention approximates the GP posterior mean:
   μ(A) = k_D(A, X) [K_D(X,X) + σ²I]⁻¹ y
 where k_D is the drug-conditional deep kernel learned by DrugConditionalEncoder.
 """
 
+from __future__ import annotations
+
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from src.models.tnp import BindingEncoder
 
 
 class DrugConditionalEncoder(nn.Module):
@@ -122,7 +122,8 @@ class GPAffinityModel(nn.Module):
          representation; correction_head reads (query_emb, attended) →
          nonlinear residual for where A diverges from context in ways D cares
          about.
-      4. Fallback: when no context, BindingEncoder(A, D) + global mean.
+      4. Fallback: when no context, uses caller-supplied prior
+         (frozen_binding_encoder(qry_protein, qry_drug) + global_mean_affinity).
     """
 
     def __init__(
@@ -158,9 +159,6 @@ class GPAffinityModel(nn.Module):
         nn.init.zeros_(self.output_head[-1].weight)
         nn.init.zeros_(self.output_head[-1].bias)
 
-        # Level 3 fallback
-        self.binding_encoder = BindingEncoder(protein_dim, drug_dim, hidden=hidden_dim)
-        self.cold_start_bias = nn.Parameter(torch.zeros(1))
         self.last_forward_stats = {}
 
     def forward(
@@ -170,7 +168,7 @@ class GPAffinityModel(nn.Module):
         ctx_proteins: torch.Tensor,    # [n_qry, K, protein_dim]
         ctx_affinities: torch.Tensor,  # [n_qry, K]  (drug_sim-scaled at level 2)
         ctx_mask: torch.Tensor,        # [n_qry, K] bool, True = valid
-        global_mean_affinity: float = 6.5,
+        prior: torch.Tensor,           # [n_qry] precomputed by caller as frozen_binding_encoder(qry_protein, qry_drug) + global_mean_affinity
     ):
         n_qry, K = ctx_proteins.shape[:2]
         device = qry_protein.device
@@ -178,9 +176,6 @@ class GPAffinityModel(nn.Module):
 
         # Drug-conditional query encoding (deep kernel)
         Q = self.encoder(qry_protein, qry_drug)  # [n_qry, out_dim]
-
-        # Level 3 fallback (always computed; used when has_ctx is False)
-        direct = self.binding_encoder(qry_protein, qry_drug) + global_mean_affinity
 
         if K > 0:
             # Drug-conditional context encoding
@@ -218,17 +213,14 @@ class GPAffinityModel(nn.Module):
         mu_residual = pred[:, 0]
         log_sigma = pred[:, 1]
 
-        # mu = GP transfer + correction when context available; direct otherwise
+        # mu = GP transfer + correction when context available; prior otherwise
         mu_ctx = transfer + mu_residual
-        mu = torch.where(has_ctx, mu_ctx, direct)
+        mu = torch.where(has_ctx, mu_ctx, prior)
 
-        # Uncertainty: elevated at cold-start
-        cold_penalty = self.cold_start_bias * (~has_ctx).float()
-        sigma = F.softplus(log_sigma + cold_penalty) + 1e-4
+        sigma = F.softplus(log_sigma) + 1e-4
 
         self.last_forward_stats = {
             "mu_std": float(mu.detach().std(unbiased=False).item()) if mu.numel() > 1 else 0.0,
-            "binding_prior_std": float(direct.detach().std(unbiased=False).item()) if direct.numel() > 1 else 0.0,
             "log_ppr_alpha": 0.0,
             "centroid_alpha": 0.0,
             "density": float(ctx_mask.float().sum(dim=1).mean().item()),
@@ -247,8 +239,9 @@ if __name__ == "__main__":
     ctx_p = torch.randn(n_qry, K, prot_dim)
     ctx_a = torch.randn(n_qry, K)
     ctx_m = torch.ones(n_qry, K, dtype=torch.bool)
+    prior = torch.full((n_qry,), 6.5)
 
-    mu, sigma = model(qry_p, qry_d, ctx_p, ctx_a, ctx_m)
+    mu, sigma = model(qry_p, qry_d, ctx_p, ctx_a, ctx_m, prior=prior)
     assert mu.shape == (n_qry,)
     assert sigma.shape == (n_qry,)
     assert (sigma > 0).all()
@@ -256,7 +249,7 @@ if __name__ == "__main__":
 
     # Cold-start: all mask False
     cold_mask = torch.zeros(n_qry, K, dtype=torch.bool)
-    mu0, sigma0 = model(qry_p, qry_d, ctx_p, ctx_a, cold_mask)
+    mu0, sigma0 = model(qry_p, qry_d, ctx_p, ctx_a, cold_mask, prior=prior)
     assert mu0.shape == (n_qry,)
     assert (sigma0 > 0).all()
     print(f"Cold: mu={mu0.mean():.3f} sigma={sigma0.mean():.3f} — PASSED")
@@ -267,6 +260,7 @@ if __name__ == "__main__":
         torch.zeros(n_qry, 0, prot_dim),
         torch.zeros(n_qry, 0),
         torch.zeros(n_qry, 0, dtype=torch.bool),
+        prior=prior,
     )
     assert mu1.shape == (n_qry,)
     print(f"K=0: mu={mu1.mean():.3f} — PASSED")
