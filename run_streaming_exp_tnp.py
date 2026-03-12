@@ -34,6 +34,26 @@ from src.training.metrics import calculate_ci, calculate_ef_at_k
 from src.training.tnp_loss import TNPLoss
 
 
+def _concordance_index(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Harrell's C-index: fraction of concordant pairs among all orderable pairs."""
+    n = pred.size(0)
+    if n < 2:
+        return 0.5
+    concordant = discordant = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dp = float(pred[i]) - float(pred[j])
+            dt = float(target[i]) - float(target[j])
+            if dt == 0:
+                continue
+            if dp * dt > 0:
+                concordant += 1
+            elif dp * dt < 0:
+                discordant += 1
+    total = concordant + discordant
+    return concordant / total if total > 0 else 0.5
+
+
 def pretrain_binding_encoder(
     protein_features: torch.Tensor,  # [N_prot, prot_dim]
     drug_features: torch.Tensor,     # [N_drug, drug_dim]
@@ -41,16 +61,18 @@ def pretrain_binding_encoder(
     labels: torch.Tensor,            # [n_edges]
     epochs: int,
     device: torch.device,
+    lr: float = 1e-3,
     hidden: int = 256,
     val_frac: float = 0.2,
+    extra_epochs: int = 0,
 ) -> "BindingEncoder":
-    """Train a BindingEncoder offline and return it frozen."""
+    """Train a BindingEncoder offline with LR scheduling and return it frozen."""
     prot_dim = protein_features.size(1)
     drug_dim = drug_features.size(1)
 
-    prot_feats = protein_features[edges[0]]
-    drug_feats = drug_features[edges[1]]
-    affinities = labels
+    prot_feats = protein_features[edges[0]].to(device)
+    drug_feats = drug_features[edges[1]].to(device)
+    affinities = labels.to(device)
 
     n = affinities.size(0)
     n_val = max(1, int(n * val_frac))
@@ -59,13 +81,13 @@ def pretrain_binding_encoder(
     train_idx = perm[n_val:]
 
     model = BindingEncoder(prot_dim, drug_dim, hidden=hidden).to(device)
-    optimizer = Adam(model.parameters(), lr=1e-3)
+    optimizer = Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=lr * 1e-3
+    )
 
-    prot_feats = prot_feats.to(device)
-    drug_feats = drug_feats.to(device)
-    affinities = affinities.to(device)
-
-    for e in range(1, epochs + 1):
+    total_epochs = epochs + extra_epochs
+    for e in range(1, total_epochs + 1):
         model.train()
         optimizer.zero_grad()
         pred_train = model(prot_feats[train_idx], drug_feats[train_idx])
@@ -73,12 +95,25 @@ def pretrain_binding_encoder(
         train_loss.backward()
         optimizer.step()
 
-        if e % 10 == 0 or e == epochs:
+        if e % 10 == 0 or e == total_epochs:
             model.eval()
             with torch.no_grad():
                 pred_val = model(prot_feats[val_idx], drug_feats[val_idx])
-                val_loss = float(F.mse_loss(pred_val, affinities[val_idx]))
-            print(f"  [pretrain] epoch {e}/{epochs} | train_mse={float(train_loss):.4f} | val_mse={val_loss:.4f}")
+                val_mse = float(F.mse_loss(pred_val, affinities[val_idx]))
+                # CI on a subsample to keep it fast (max 2000 pairs)
+                ci_idx = val_idx[:2000] if val_idx.size(0) > 2000 else val_idx
+                ci = _concordance_index(
+                    model(prot_feats[ci_idx], drug_feats[ci_idx]),
+                    affinities[ci_idx],
+                )
+            scheduler.step(val_mse)
+            current_lr = optimizer.param_groups[0]["lr"]
+            phase = "base" if e <= epochs else "ext "
+            print(
+                f"  [pretrain/{phase}] epoch {e}/{total_epochs} | "
+                f"train_mse={float(train_loss):.4f} | val_mse={val_mse:.4f} | "
+                f"val_CI={ci:.3f} | lr={current_lr:.2e}"
+            )
 
     for p in model.parameters():
         p.requires_grad_(False)
@@ -234,6 +269,10 @@ def build_arg_parser():
     )
     parser.add_argument("--pretrain-epochs", type=int, default=100,
                         help="Epochs for offline BindingEncoder pretraining (GP model only)")
+    parser.add_argument("--pretrain-lr", type=float, default=1e-3,
+                        help="Learning rate for offline BindingEncoder pretraining")
+    parser.add_argument("--pretrain-extra-epochs", type=int, default=0,
+                        help="Additional epochs to run after LR scheduler has converged")
     return parser
 
 
@@ -786,7 +825,9 @@ def main():
             all_edges, all_labels,
             epochs=args.pretrain_epochs,
             device=device,
+            lr=args.pretrain_lr,
             hidden=args.token_dim,
+            extra_epochs=args.pretrain_extra_epochs,
         )
         print("BindingEncoder pretrained and frozen.")
 
