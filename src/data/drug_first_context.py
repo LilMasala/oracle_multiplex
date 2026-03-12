@@ -157,6 +157,7 @@ class DrugFirstContextBuilder:
         ctx_mask: torch.Tensor,            # [n_qry, K]               modified in-place
         device: torch.device,
         max_pool: int = 512,               # cap neighbourhood pool before similarity search
+        affinity_offset: float = 0.0,      # subtract from pool affinities before storing (set to global_mean when GP uses residuals)
     ):
         """
         Level 3: for queries still lacking context after levels 1-2, fall back to
@@ -201,7 +202,7 @@ class DrugFirstContextBuilder:
             pool_drug_idxs = pool_drug_idxs[perm]
             pool_affs = pool_affs[perm]
 
-        pool_affs = pool_affs.to(device)
+        pool_affs = pool_affs.to(device) - affinity_offset  # center when GP stores residuals
         pool_prot_feats = self.protein_features[pool_prot_idxs].to(device)
         pool_drug_feats = self.drug_features[pool_drug_idxs].to(device)
 

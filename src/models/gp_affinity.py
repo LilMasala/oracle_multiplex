@@ -216,8 +216,9 @@ class GPAffinityModel(nn.Module):
         mu_residual = pred[:, 0]
         log_sigma = pred[:, 1]
 
-        # mu = GP transfer + correction when context available; prior otherwise
-        mu_ctx = transfer + mu_residual
+        # mu = prior + GP residual transfer + correction when context available; prior otherwise.
+        # Context stores residuals (label - prior), so we must add prior back to get absolute scale.
+        mu_ctx = prior + transfer + mu_residual
         mu = torch.where(has_ctx, mu_ctx, prior)
 
         sigma = F.softplus(log_sigma) + 1e-4

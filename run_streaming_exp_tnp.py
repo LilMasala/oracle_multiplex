@@ -65,14 +65,23 @@ def pretrain_binding_encoder(
     hidden: int = 256,
     val_frac: float = 0.2,
     extra_epochs: int = 0,
+    global_mean: float = 0.0,
 ) -> "BindingEncoder":
-    """Train a BindingEncoder offline with LR scheduling and return it frozen."""
+    """Train a BindingEncoder offline with LR scheduling and return it frozen.
+
+    The encoder is trained on mean-centered targets (labels - global_mean) so
+    that its output represents deviations from the global mean.  compute_prior()
+    and compute_residuals() then correctly reconstruct:
+        prior   = be(p, d) + global_mean
+        residual = label - be(p, d) - global_mean
+    """
     prot_dim = protein_features.size(1)
     drug_dim = drug_features.size(1)
 
     prot_feats = protein_features[edges[0]].to(device)
     drug_feats = drug_features[edges[1]].to(device)
-    affinities = labels.to(device)
+    # Center targets: encoder predicts deviation from global mean, not raw affinity
+    affinities = (labels - global_mean).to(device)
 
     n = affinities.size(0)
     n_val = max(1, int(n * val_frac))
@@ -602,8 +611,12 @@ def run_episode_gp(
     ctx_proteins, ctx_affinities, ctx_mask = gp_builder.build_context(
         target_idx, query_drug_indices, device
     )
+    # When frozen_be is active, GP history stores residuals (label - prior).
+    # Pass global_mean as offset so level-3 pool affinities are also centered.
+    fallback_offset = global_mean_affinity if frozen_be is not None else 0.0
     gp_builder.apply_neighborhood_fallback(
-        pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device
+        pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device,
+        affinity_offset=fallback_offset,
     )
     prior = compute_prior(frozen_be, qry_protein, qry_drug, global_mean_affinity)
     mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, prior)
@@ -873,6 +886,7 @@ def main():
             lr=args.pretrain_lr,
             hidden=args.token_dim,
             extra_epochs=args.pretrain_extra_epochs,
+            global_mean=global_mean_affinity,
         )
         print("BindingEncoder pretrained and frozen.")
 
