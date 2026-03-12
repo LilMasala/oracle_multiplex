@@ -260,6 +260,8 @@ def build_arg_parser():
     parser.add_argument("--train-scope", choices=["full", "head-only"], default="full")
     parser.add_argument("--unfreeze-after", type=int, default=None, help="Episode index at which TNP switches from head-only to full")
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
+    parser.add_argument("--resume-from", default=None, help="Resume from a prequential checkpoint saved by --checkpoint-every")
+    parser.add_argument("--checkpoint-every", type=int, default=100, help="Save a resumable checkpoint every N stream episodes (0 = disabled)")
     parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
     parser.add_argument(
         "--historical-protein-frac",
@@ -365,6 +367,48 @@ def maybe_load_model_warmstart(model, path, device):
         state = state["model_state_dict"]
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded model warmstart from {path} | missing={len(missing)} unexpected={len(unexpected)}")
+
+
+def save_checkpoint(path, *, model, optimizer, frozen_be, gp_builder, replay_buffer, episode_log, ci_history, ef10_history, regime_counts, stream_episode_idx, seed):
+    """Save full prequential state so a disconnected run can resume exactly."""
+    ckpt = {
+        "stream_episode_idx": stream_episode_idx,
+        "seed": seed,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "episode_log": episode_log,
+        "ci_history": ci_history,
+        "ef10_history": ef10_history,
+        "regime_counts": regime_counts,
+        "drug_to_bindings": dict(gp_builder._drug_to_bindings) if gp_builder is not None else None,
+        "replay_indices": list(replay_buffer._indices),
+        "replay_sketches": [s.cpu() for s in replay_buffer._sketches],
+    }
+    if frozen_be is not None:
+        ckpt["frozen_be_state_dict"] = frozen_be.state_dict()
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, *, model, optimizer, frozen_be, gp_builder, replay_buffer, device):
+    """Restore prequential state from a checkpoint. Returns (stream_episode_idx, episode_log, ci_history, ef10_history, regime_counts)."""
+    from collections import defaultdict
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if gp_builder is not None and ckpt.get("drug_to_bindings") is not None:
+        gp_builder._drug_to_bindings = defaultdict(list, {int(k): v for k, v in ckpt["drug_to_bindings"].items()})
+    if frozen_be is not None and "frozen_be_state_dict" in ckpt:
+        frozen_be.load_state_dict(ckpt["frozen_be_state_dict"])
+    replay_buffer._indices = ckpt["replay_indices"]
+    replay_buffer._sketches = [s.to(replay_buffer.device) for s in ckpt["replay_sketches"]]
+    print(f"Resumed from checkpoint: stream episode {ckpt['stream_episode_idx']} | {len(ckpt['episode_log'])} logged episodes")
+    return (
+        ckpt["stream_episode_idx"],
+        ckpt["episode_log"],
+        ckpt["ci_history"],
+        ckpt["ef10_history"],
+        ckpt["regime_counts"],
+    )
 
 
 def build_gnn_runtime(args, data, prot_dim, device):
@@ -861,11 +905,20 @@ def main():
     model_path = os.path.join("models", f"{run_name}.pt")
     results_path = os.path.join("results", f"{run_name}.csv")
     summary_path = os.path.join("results", f"{run_name}_cold_start_summary.csv")
+    checkpoint_path = os.path.join("models", f"{run_name}_ckpt.pt")
 
     episode_log = []
     ci_history = []
     ef10_history = []
     regime_counts = {"cold": 0, "sparse": 0, "warm": 0}
+
+    resume_stream_idx = 0
+    if args.resume_from is not None:
+        resume_stream_idx, episode_log, ci_history, ef10_history, regime_counts = load_checkpoint(
+            args.resume_from,
+            model=model, optimizer=optimizer, frozen_be=frozen_be,
+            gp_builder=gp_builder, replay_buffer=replay_buffer, device=device,
+        )
     roll_window = 100
     train_scope_upgraded = False
     total_episode_budget = len(historical_episodes) + len(stream_episodes)
@@ -920,6 +973,8 @@ def main():
         )
 
     for i, ep in enumerate(stream_episodes):
+        if i < resume_stream_idx:
+            continue  # gp_builder + optimizer state already restored from checkpoint
         global_episode_idx = len(historical_episodes) + i
         loader.begin_episode(global_episode_idx)
         if (
@@ -1030,6 +1085,16 @@ def main():
                 "w_lambda": w_lambda,
             }
         )
+
+        if args.checkpoint_every > 0 and (i + 1) % args.checkpoint_every == 0:
+            save_checkpoint(
+                checkpoint_path,
+                model=model, optimizer=optimizer, frozen_be=frozen_be,
+                gp_builder=gp_builder, replay_buffer=replay_buffer,
+                episode_log=episode_log, ci_history=ci_history,
+                ef10_history=ef10_history, regime_counts=regime_counts,
+                stream_episode_idx=i + 1, seed=args.seed,
+            )
 
         if i % 5 == 0:
             print(
