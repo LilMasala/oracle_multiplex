@@ -870,7 +870,7 @@ def main():
     train_scope_upgraded = False
     total_episode_budget = len(historical_episodes) + len(stream_episodes)
 
-    if historical_episodes:
+    if historical_episodes and frozen_be is None:
         print("\nConsuming historical split before streamed evaluation...")
         for hist_i, ep in enumerate(historical_episodes):
             loader.begin_episode(hist_i)
