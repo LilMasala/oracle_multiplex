@@ -17,6 +17,7 @@ from typing import Optional
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 
 from src.data.binds_activity import merge_activity_edges
@@ -26,11 +27,87 @@ from src.data.drug_first_context import DrugFirstContextBuilder
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.models.gp_affinity import GPAffinityModel
 from src.models.neighbor_transfer import NeighborTransferModel
-from src.models.tnp import BindingOnlyAffinityModel, ProteinLigandTNP
+from src.models.tnp import BindingEncoder, BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
 from src.training.cold_start_metrics import classify_regime, summarize_cold_start
 from src.training.metrics import calculate_ci, calculate_ef_at_k
 from src.training.tnp_loss import TNPLoss
+
+
+def pretrain_binding_encoder(
+    protein_features: torch.Tensor,  # [N_prot, prot_dim]
+    drug_features: torch.Tensor,     # [N_drug, drug_dim]
+    edges: torch.Tensor,             # [2, n_edges]
+    labels: torch.Tensor,            # [n_edges]
+    epochs: int,
+    device: torch.device,
+    hidden: int = 256,
+    val_frac: float = 0.2,
+) -> "BindingEncoder":
+    """Train a BindingEncoder offline and return it frozen."""
+    prot_dim = protein_features.size(1)
+    drug_dim = drug_features.size(1)
+
+    prot_feats = protein_features[edges[0]]
+    drug_feats = drug_features[edges[1]]
+    affinities = labels
+
+    n = affinities.size(0)
+    n_val = max(1, int(n * val_frac))
+    perm = torch.randperm(n)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+
+    model = BindingEncoder(prot_dim, drug_dim, hidden=hidden).to(device)
+    optimizer = Adam(model.parameters(), lr=1e-3)
+
+    prot_feats = prot_feats.to(device)
+    drug_feats = drug_feats.to(device)
+    affinities = affinities.to(device)
+
+    for e in range(1, epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        pred_train = model(prot_feats[train_idx], drug_feats[train_idx])
+        train_loss = F.mse_loss(pred_train, affinities[train_idx])
+        train_loss.backward()
+        optimizer.step()
+
+        if e % 10 == 0 or e == epochs:
+            model.eval()
+            with torch.no_grad():
+                pred_val = model(prot_feats[val_idx], drug_feats[val_idx])
+                val_loss = float(F.mse_loss(pred_val, affinities[val_idx]))
+            print(f"  [pretrain] epoch {e}/{epochs} | train_mse={float(train_loss):.4f} | val_mse={val_loss:.4f}")
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+def compute_prior(
+    frozen_be,           # BindingEncoder or None
+    qry_protein,         # [n_qry, prot_dim]
+    qry_drug,            # [n_qry, drug_dim]
+    global_mean: float,
+) -> torch.Tensor:
+    if frozen_be is None:
+        return torch.full((qry_protein.size(0),), global_mean, device=qry_protein.device)
+    with torch.no_grad():
+        return frozen_be(qry_protein, qry_drug) + global_mean
+
+
+def compute_residuals(
+    frozen_be,           # BindingEncoder or None
+    prot_feats,          # [n, prot_dim]
+    drug_feats,          # [n, drug_dim]
+    labels,              # [n]
+    global_mean: float,
+) -> torch.Tensor:
+    if frozen_be is None:
+        return labels
+    with torch.no_grad():
+        return labels - frozen_be(prot_feats, drug_feats) - global_mean
 
 
 class GlobalMeanAffinityModel(nn.Module):
@@ -148,7 +225,6 @@ def build_arg_parser():
     parser.add_argument("--train-scope", choices=["full", "head-only"], default="full")
     parser.add_argument("--unfreeze-after", type=int, default=None, help="Episode index at which TNP switches from head-only to full")
     parser.add_argument("--warmstart-checkpoint", default=None, help="Optional full-model warmstart checkpoint")
-    parser.add_argument("--binding-warmstart", default=None, help="Optional binding-encoder checkpoint")
     parser.add_argument("--neighbor-k", type=int, default=8, help="Top-k exact-drug neighbors for neighbor-transfer model")
     parser.add_argument(
         "--historical-protein-frac",
@@ -156,6 +232,8 @@ def build_arg_parser():
         default=0.0,
         help="Protein-disjoint fraction consumed before the streamed evaluation and used to seed history",
     )
+    parser.add_argument("--pretrain-epochs", type=int, default=100,
+                        help="Epochs for offline BindingEncoder pretraining (GP model only)")
     return parser
 
 
@@ -240,30 +318,6 @@ def set_tnp_train_scope(model, scope: str):
     model.cold_start_bias.requires_grad = True
 
 
-def maybe_load_binding_warmstart(model, path, device):
-    if path is None or not hasattr(model, "binding_encoder"):
-        return
-
-    state = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    binding_state = {}
-    if isinstance(state, dict):
-        for key, value in state.items():
-            if key.startswith("binding_encoder."):
-                binding_state[key.split("binding_encoder.", 1)[1]] = value
-
-    if not binding_state and isinstance(state, dict):
-        binding_state = {k: v for k, v in state.items() if k.startswith("net.")}
-
-    if not binding_state:
-        raise ValueError(f"No binding_encoder weights found in {path}")
-
-    missing, unexpected = model.binding_encoder.load_state_dict(binding_state, strict=False)
-    print(f"Loaded binding warmstart from {path} | missing={len(missing)} unexpected={len(unexpected)}")
-
-
 def maybe_load_model_warmstart(model, path, device):
     if path is None:
         return
@@ -333,7 +387,6 @@ def build_model(args, prot_dim, drug_dim, gnn_emb_dim, go_fp_dim, device):
 
     model = model.to(device)
     maybe_load_model_warmstart(model, args.warmstart_checkpoint, device)
-    maybe_load_binding_warmstart(model, args.binding_warmstart, device)
     set_tnp_train_scope(model, args.train_scope)
     return model
 
@@ -452,6 +505,7 @@ def run_episode_gp(
     pillar: dict,
     query_drug_indices: torch.Tensor,
     global_mean_affinity: float = 6.5,
+    frozen_be=None,
 ):
     target = pillar["target_features"]
     target_idx = int(pillar["target_idx"])
@@ -467,7 +521,8 @@ def run_episode_gp(
     gp_builder.apply_neighborhood_fallback(
         pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device
     )
-    mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, global_mean_affinity)
+    prior = compute_prior(frozen_be, qry_protein, qry_drug, global_mean_affinity)
+    mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, prior)
 
     stats = collect_forward_stats(model)
     stats["n_ctx"] = int(ctx_mask.float().sum(dim=1).mean().item())
@@ -490,6 +545,7 @@ def optimize_episode_gp(
     episode_idx: int,
     total_episodes: int,
     replay_edges_per_protein: int = 256,
+    frozen_be=None,
 ):
     train_loss = nll_val = replay_loss_val = float("nan")
     w_nll = w_listnet = w_lambda = float("nan")
@@ -503,7 +559,8 @@ def optimize_episode_gp(
     loss_fn.step_schedule(episode_idx, total_episodes)
 
     mu, sigma, _ = run_episode_gp(
-        model, gp_builder, drug_features, pillar, query_drug_indices, global_mean_affinity
+        model, gp_builder, drug_features, pillar, query_drug_indices, global_mean_affinity,
+        frozen_be=frozen_be,
     )
     result = loss_fn(mu, sigma, labels.to(query_drug_indices.device))
     result["total_loss"].backward()
@@ -520,7 +577,8 @@ def optimize_episode_gp(
         replay_total = torch.tensor(0.0, device=query_drug_indices.device)
         for _, replay_edges, replay_labels, replay_pillar in replay_batches:
             r_mu, r_sigma, _ = run_episode_gp(
-                model, gp_builder, drug_features, replay_pillar, replay_edges[1], global_mean_affinity
+                model, gp_builder, drug_features, replay_pillar, replay_edges[1], global_mean_affinity,
+                frozen_be=frozen_be,
             )
             r_result = loss_fn(r_mu, r_sigma, replay_labels.to(query_drug_indices.device))
             replay_total = replay_total + r_result["total_loss"]
@@ -718,6 +776,28 @@ def main():
             analog_min_sim=0.5,
         )
 
+    frozen_be = None
+    if args.model_kind == "gp" and args.historical_protein_frac > 0 and historical_episodes:
+        print(f"\nPretraining BindingEncoder on {len(historical_episodes)} historical proteins...")
+        all_edges = torch.cat([ep.edges for ep in historical_episodes], dim=1)
+        all_labels = torch.cat([ep.labels for ep in historical_episodes])
+        frozen_be = pretrain_binding_encoder(
+            data["protein"].x, drug_features,
+            all_edges, all_labels,
+            epochs=args.pretrain_epochs,
+            device=device,
+            hidden=args.token_dim,
+        )
+        print("BindingEncoder pretrained and frozen.")
+
+        print("Populating GP history with residuals from historical proteins...")
+        for ep in historical_episodes:
+            prot_feats = data["protein"].x[ep.edges[0]]
+            drug_feats_ep = drug_features[ep.edges[1]]
+            store_labels = compute_residuals(frozen_be, prot_feats, drug_feats_ep, ep.labels, global_mean_affinity)
+            gp_builder.add_revealed(ep.edges, store_labels)
+        print(f"GP history populated with {all_labels.size(0)} residual bindings.")
+
     stream_title = "HISTORICAL-SEEDED PREQUENTIAL STREAM" if historical_episodes else "STARTING STRICT PREQUENTIAL STREAM"
     print(f"\n{stream_title}")
     print(f"  run name:        {run_name}")
@@ -770,6 +850,7 @@ def main():
                     model, loss_fn, optimizer, gp_builder, drug_features,
                     pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                     global_mean_affinity, args.replay_weight, hist_i, total_episode_budget,
+                    frozen_be=frozen_be,
                 )
             else:
                 optimize_episode(
@@ -778,7 +859,8 @@ def main():
                     gnn_runtime, global_mean_affinity, total_episode_budget, hist_i,
                 )
             loader.add_revealed_edges(ep.edges, ep.labels)
-            if gp_builder is not None:
+            if gp_builder is not None and frozen_be is None:
+                # When frozen_be is set, gp_builder was pre-populated with residuals above
                 gp_builder.add_revealed(ep.edges, ep.labels)
             replay_buffer.add(ep.protein_idx, pillar["target_features"])
 
@@ -818,6 +900,7 @@ def main():
             if gp_builder is not None:
                 mu_eval, sigma_eval, eval_stats = run_episode_gp(
                     model, gp_builder, drug_features, pillar, ep.edges[1], global_mean_affinity,
+                    frozen_be=frozen_be,
                 )
             else:
                 mu_eval, sigma_eval, eval_stats = run_episode(
@@ -855,6 +938,7 @@ def main():
                 model, loss_fn, optimizer, gp_builder, drug_features,
                 pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                 global_mean_affinity, args.replay_weight, global_episode_idx, total_episode_budget,
+                frozen_be=frozen_be,
             )
         else:
             train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(
@@ -865,7 +949,10 @@ def main():
 
         loader.add_revealed_edges(ep.edges, ep.labels)
         if gp_builder is not None:
-            gp_builder.add_revealed(ep.edges, ep.labels)
+            prot_feats = data["protein"].x[ep.edges[0]]
+            drug_feats_ep = drug_features[ep.edges[1]]
+            store_labels = compute_residuals(frozen_be, prot_feats, drug_feats_ep, ep.labels, global_mean_affinity)
+            gp_builder.add_revealed(ep.edges, store_labels)
         replay_buffer.add(ep.protein_idx, pillar["target_features"])
         history_after = loader.history_stats()
 
@@ -912,7 +999,6 @@ def main():
                 f" | history: {history_before['revealed_edge_count']} -> {history_after['revealed_edge_count']}"
                 f" | dup: {history_after['duplicate_revealed_edges']}"
                 f" | mu_std: {eval_stats['mu_std']:.3f}"
-                f" | binding_std: {eval_stats['binding_prior_std']:.3f}"
             )
 
     if args.history_mode == "empty" and not historical_episodes and regime_counts["cold"] + regime_counts["sparse"] == 0:
