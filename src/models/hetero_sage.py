@@ -88,7 +88,7 @@ class HeteroGraphSAGE(torch.nn.Module):
         self,
         z_dict: dict,
         edge_index: torch.Tensor,
-        edge_type: tuple = ("protein", "binds", "drug"),
+        edge_type: tuple = ("protein", "binds_activity", "drug"),
     ) -> torch.Tensor:
         src, dst = edge_index
         return self.scorer(z_dict[edge_type[0]][src], z_dict[edge_type[2]][dst])

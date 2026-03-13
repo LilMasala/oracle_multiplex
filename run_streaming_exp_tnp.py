@@ -28,6 +28,7 @@ from src.data.multiplex_loader import MultiplexPillarSampler
 from src.models.gp_affinity import GPAffinityModel
 from src.models.hetero_sage import HeteroGraphSAGE
 from src.models.neighbor_transfer import NeighborTransferModel
+from src.models.mol_graph_encoder import MolGraphPrior
 from src.models.protein_drug_ranker import ProteinDrugRanker
 from src.models.tnp import BindingEncoder, BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
@@ -441,7 +442,7 @@ def build_arg_parser():
                         help="Learning rate for offline BindingEncoder pretraining")
     parser.add_argument("--pretrain-extra-epochs", type=int, default=0,
                         help="Additional epochs to run after LR scheduler has converged")
-    parser.add_argument("--gnn-prior", choices=["none", "sage", "ranker"], default="none",
+    parser.add_argument("--gnn-prior", choices=["none", "sage", "ranker", "mol"], default="none",
                         help="Use a pretrained GNN as the GP prior instead of BindingEncoder")
     parser.add_argument("--gnn-pretrain-epochs", type=int, default=100,
                         help="Epochs for offline GNN prior pretraining")
@@ -451,6 +452,13 @@ def build_arg_parser():
                         help="Hidden dimension for GNN prior")
     parser.add_argument("--gnn-label-offset", type=float, default=None,
                         help="Label offset for GNN prior (default: global_mean_affinity)")
+    parser.add_argument(
+        "--mol-prior-dir",
+        type=str,
+        default=None,
+        help="Directory containing mol_prior_model.pt and mol_prior_tables.pt. "
+             "Required when --gnn-prior mol is used.",
+    )
     return parser
 
 
@@ -1053,7 +1061,32 @@ def main():
         all_edges = torch.cat([ep.edges for ep in historical_episodes], dim=1)
         all_labels = torch.cat([ep.labels for ep in historical_episodes])
 
-        if args.gnn_prior != "none":
+        if args.gnn_prior == "mol":
+            assert args.mol_prior_dir is not None, "--mol-prior-dir is required when --gnn-prior mol"
+            tables = torch.load(
+                os.path.join(args.mol_prior_dir, "mol_prior_tables.pt"), weights_only=False
+            )
+            _mol_model = MolGraphPrior(
+                n_go_terms=int(tables["n_go_terms"]),
+                hidden=int(tables["hidden"]),
+                bilinear_rank=int(tables["bilinear_rank"]),
+            ).to(device)
+            _mol_model.load_state_dict(
+                torch.load(
+                    os.path.join(args.mol_prior_dir, "mol_prior_model.pt"), weights_only=False
+                )
+            )
+            for _p in _mol_model.parameters():
+                _p.requires_grad_(False)
+            _mol_model.eval()
+            gnn_prior = GNNPrior(
+                gnn=_mol_model,
+                protein_embeddings=tables["prot_emb"],
+                drug_embeddings=tables["drug_emb"],
+                label_offset=float(tables["label_offset"]),
+                device=device,
+            )
+        elif args.gnn_prior in ("sage", "ranker"):
             gnn_label_offset = args.gnn_label_offset if args.gnn_label_offset is not None else global_mean_affinity
             print(f"\nPretraining GNN prior ({args.gnn_prior}) on {len(historical_episodes)} historical proteins "
                   f"(label_offset={gnn_label_offset:.3f})...")
