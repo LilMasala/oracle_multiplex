@@ -26,7 +26,9 @@ from src.data.diverse_replay_buffer import DiverseReplayBuffer
 from src.data.drug_first_context import DrugFirstContextBuilder
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.models.gp_affinity import GPAffinityModel
+from src.models.hetero_sage import HeteroGraphSAGE
 from src.models.neighbor_transfer import NeighborTransferModel
+from src.models.protein_drug_ranker import ProteinDrugRanker
 from src.models.tnp import BindingEncoder, BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
 from src.training.cold_start_metrics import classify_regime, summarize_cold_start
@@ -129,12 +131,159 @@ def pretrain_binding_encoder(
     return model
 
 
+class GNNPrior:
+    """Frozen GNN used as a function-valued prior for the GP.
+
+    Stores precomputed protein and drug embeddings (CPU) and the full GNN model
+    (on device, for the link scorer). At inference: look up embeddings, call
+    predict_links, add label_offset.
+    """
+
+    def __init__(self, gnn, protein_embeddings: torch.Tensor, drug_embeddings: torch.Tensor,
+                 label_offset: float, device: torch.device):
+        self.gnn = gnn  # frozen, on device
+        self.protein_embeddings = protein_embeddings.cpu()  # [N_prot, h]
+        self.drug_embeddings = drug_embeddings.cpu()        # [N_drug, h]
+        self.label_offset = label_offset
+        self.device = device
+
+    def _z_dict(self):
+        return {
+            "protein": self.protein_embeddings.to(self.device),
+            "drug": self.drug_embeddings.to(self.device),
+        }
+
+    @torch.no_grad()
+    def predict(self, protein_idx: int, drug_indices: torch.Tensor) -> torch.Tensor:
+        """Scores for a single protein against each drug in drug_indices."""
+        n = drug_indices.size(0)
+        src = torch.full((n,), protein_idx, dtype=torch.long, device=self.device)
+        dst = drug_indices.to(self.device)
+        scores = self.gnn.predict_links(self._z_dict(), torch.stack([src, dst]))
+        return scores + self.label_offset
+
+    @torch.no_grad()
+    def predict_batch(self, protein_indices: torch.Tensor, drug_indices: torch.Tensor) -> torch.Tensor:
+        """Scores for paired (protein_idx[i], drug_idx[i]) entries."""
+        src = protein_indices.to(self.device)
+        dst = drug_indices.to(self.device)
+        scores = self.gnn.predict_links(self._z_dict(), torch.stack([src, dst]))
+        return scores + self.label_offset
+
+
+def pretrain_gnn(
+    gnn_kind: str,           # "sage" or "ranker"
+    data,                    # full HeteroData on device
+    hist_edges: torch.Tensor,   # [2, n_edges]
+    hist_labels: torch.Tensor,  # [n_edges]
+    epochs: int,
+    device: torch.device,
+    lr: float = 1e-3,
+    hidden: int = 256,
+    val_frac: float = 0.2,
+    label_offset: float = 0.0,
+) -> GNNPrior:
+    """Train a GNN on historical edges and return a frozen GNNPrior with precomputed embeddings."""
+    prot_dim = data["protein"].x.size(1)
+    drug_dim = data["drug"].x.size(1)
+    go_feat_dim = data["go"].x.size(1) if "go" in data.node_types else 200
+
+    if gnn_kind == "sage":
+        gnn = HeteroGraphSAGE(
+            hidden_channels=hidden,
+            protein_feat_dim=prot_dim,
+            drug_feat_dim=drug_dim,
+            go_feat_dim=go_feat_dim,
+        ).to(device)
+    else:  # ranker
+        protein_esm_dim = 2048
+        protein_cath_dim = min(768, prot_dim - protein_esm_dim)
+        gnn = ProteinDrugRanker(
+            hidden_channels=hidden,
+            protein_feat_dim=prot_dim,
+            drug_feat_dim=drug_dim,
+            go_feat_dim=go_feat_dim,
+            protein_esm_dim=protein_esm_dim,
+            protein_cath_dim=protein_cath_dim,
+        ).to(device)
+
+    # Build full-graph x_dict and edge_index_dict (exclude binding edges)
+    x_dict = {k: data[k].x.to(device) for k in data.node_types}
+    edge_index_dict = {
+        et: data[et].edge_index.to(device)
+        for et in data.edge_types
+        if "binds" not in et[1]
+    }
+
+    # Shift labels: GNN predicts (affinity - label_offset)
+    shifted = (hist_labels - label_offset).to(device)
+    n = hist_edges.size(1)
+    perm = torch.randperm(n)
+    n_val = max(1, int(n * val_frac))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    train_ei = hist_edges[:, train_idx].to(device)
+    val_ei = hist_edges[:, val_idx].to(device)
+
+    optimizer_gnn = Adam(gnn.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_gnn, mode="min", factor=0.5, patience=10, min_lr=lr * 1e-3
+    )
+
+    for e in range(1, epochs + 1):
+        gnn.train()
+        optimizer_gnn.zero_grad()
+        z = gnn(x_dict, edge_index_dict)
+        pred = gnn.predict_links(z, train_ei)
+        loss = F.mse_loss(pred, shifted[train_idx])
+        loss.backward()
+        optimizer_gnn.step()
+
+        if e % 10 == 0 or e == epochs:
+            gnn.eval()
+            with torch.no_grad():
+                z_v = gnn(x_dict, edge_index_dict)
+                pred_v = gnn.predict_links(z_v, val_ei)
+                val_mse = float(F.mse_loss(pred_v, shifted[val_idx]))
+                ci_sub = val_idx[:2000]
+                ci_v = _concordance_index(
+                    gnn.predict_links(z_v, hist_edges[:, ci_sub].to(device)),
+                    shifted[ci_sub],
+                )
+            scheduler.step(val_mse)
+            current_lr = optimizer_gnn.param_groups[0]["lr"]
+            print(
+                f"  [gnn/{gnn_kind}] epoch {e}/{epochs} | "
+                f"train_mse={float(loss):.4f} | val_mse={val_mse:.4f} | "
+                f"val_CI={ci_v:.3f} | lr={current_lr:.2e}"
+            )
+
+    # Precompute all embeddings on the full graph (inductive: includes streaming proteins)
+    gnn.eval()
+    with torch.no_grad():
+        z_full = gnn(x_dict, edge_index_dict)
+    protein_embeddings = z_full["protein"].cpu()
+    drug_embeddings = z_full["drug"].cpu()
+
+    for p in gnn.parameters():
+        p.requires_grad_(False)
+
+    print(f"GNN ({gnn_kind}) pretrained and frozen. Embeddings: proteins={protein_embeddings.shape}, drugs={drug_embeddings.shape}")
+    return GNNPrior(gnn, protein_embeddings, drug_embeddings, label_offset, device)
+
+
 def compute_prior(
     frozen_be,           # BindingEncoder or None
     qry_protein,         # [n_qry, prot_dim]
     qry_drug,            # [n_qry, drug_dim]
     global_mean: float,
+    *,
+    gnn_prior: "GNNPrior | None" = None,
+    protein_idx: int = 0,
+    drug_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if gnn_prior is not None:
+        return gnn_prior.predict(protein_idx, drug_indices)
     if frozen_be is None:
         return torch.full((qry_protein.size(0),), global_mean, device=qry_protein.device)
     with torch.no_grad():
@@ -147,7 +296,14 @@ def compute_residuals(
     drug_feats,          # [n, drug_dim]
     labels,              # [n]
     global_mean: float,
+    *,
+    gnn_prior: "GNNPrior | None" = None,
+    protein_indices: Optional[torch.Tensor] = None,
+    drug_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if gnn_prior is not None:
+        pred = gnn_prior.predict_batch(protein_indices, drug_indices)
+        return labels.to(pred.device) - pred
     if frozen_be is None:
         return labels
     with torch.no_grad():
@@ -285,6 +441,16 @@ def build_arg_parser():
                         help="Learning rate for offline BindingEncoder pretraining")
     parser.add_argument("--pretrain-extra-epochs", type=int, default=0,
                         help="Additional epochs to run after LR scheduler has converged")
+    parser.add_argument("--gnn-prior", choices=["none", "sage", "ranker"], default="none",
+                        help="Use a pretrained GNN as the GP prior instead of BindingEncoder")
+    parser.add_argument("--gnn-pretrain-epochs", type=int, default=100,
+                        help="Epochs for offline GNN prior pretraining")
+    parser.add_argument("--gnn-pretrain-lr", type=float, default=1e-3,
+                        help="Learning rate for GNN prior pretraining")
+    parser.add_argument("--gnn-hidden", type=int, default=256,
+                        help="Hidden dimension for GNN prior")
+    parser.add_argument("--gnn-label-offset", type=float, default=None,
+                        help="Label offset for GNN prior (default: global_mean_affinity)")
     return parser
 
 
@@ -347,6 +513,8 @@ def default_run_name(args):
         parts.append("analogs")
     if args.gnn_mode != "off":
         parts.append(f"gnn_{args.gnn_mode}")
+    if getattr(args, "gnn_prior", "none") != "none":
+        parts.append(f"gnnprior_{args.gnn_prior}")
     return "_".join(parts)
 
 
@@ -599,6 +767,7 @@ def run_episode_gp(
     query_drug_indices: torch.Tensor,
     global_mean_affinity: float = 6.5,
     frozen_be=None,
+    gnn_prior: "GNNPrior | None" = None,
 ):
     target = pillar["target_features"]
     target_idx = int(pillar["target_idx"])
@@ -611,14 +780,18 @@ def run_episode_gp(
     ctx_proteins, ctx_affinities, ctx_mask = gp_builder.build_context(
         target_idx, query_drug_indices, device
     )
-    # When frozen_be is active, GP history stores residuals (label - prior).
-    # Pass global_mean as offset so level-3 pool affinities are also centered.
-    fallback_offset = global_mean_affinity if frozen_be is not None else 0.0
+    # When a prior is active, GP history stores residuals (label - prior).
+    # Level-3 pool uses raw labels from loader, so subtract global_mean to centre.
+    has_prior = frozen_be is not None or gnn_prior is not None
+    fallback_offset = global_mean_affinity if has_prior else 0.0
     gp_builder.apply_neighborhood_fallback(
         pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device,
         affinity_offset=fallback_offset,
     )
-    prior = compute_prior(frozen_be, qry_protein, qry_drug, global_mean_affinity)
+    prior = compute_prior(
+        frozen_be, qry_protein, qry_drug, global_mean_affinity,
+        gnn_prior=gnn_prior, protein_idx=target_idx, drug_indices=query_drug_indices,
+    )
     mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, prior)
 
     stats = collect_forward_stats(model)
@@ -643,6 +816,7 @@ def optimize_episode_gp(
     total_episodes: int,
     replay_edges_per_protein: int = 256,
     frozen_be=None,
+    gnn_prior: "GNNPrior | None" = None,
 ):
     train_loss = nll_val = replay_loss_val = float("nan")
     w_nll = w_listnet = w_lambda = float("nan")
@@ -657,7 +831,7 @@ def optimize_episode_gp(
 
     mu, sigma, _ = run_episode_gp(
         model, gp_builder, drug_features, pillar, query_drug_indices, global_mean_affinity,
-        frozen_be=frozen_be,
+        frozen_be=frozen_be, gnn_prior=gnn_prior,
     )
     result = loss_fn(mu, sigma, labels.to(query_drug_indices.device))
     result["total_loss"].backward()
@@ -675,7 +849,7 @@ def optimize_episode_gp(
         for _, replay_edges, replay_labels, replay_pillar in replay_batches:
             r_mu, r_sigma, _ = run_episode_gp(
                 model, gp_builder, drug_features, replay_pillar, replay_edges[1], global_mean_affinity,
-                frozen_be=frozen_be,
+                frozen_be=frozen_be, gnn_prior=gnn_prior,
             )
             r_result = loss_fn(r_mu, r_sigma, replay_labels.to(query_drug_indices.device))
             replay_total = replay_total + r_result["total_loss"]
@@ -874,27 +1048,49 @@ def main():
         )
 
     frozen_be = None
+    gnn_prior = None
     if args.model_kind == "gp" and args.historical_protein_frac > 0 and historical_episodes:
-        print(f"\nPretraining BindingEncoder on {len(historical_episodes)} historical proteins...")
         all_edges = torch.cat([ep.edges for ep in historical_episodes], dim=1)
         all_labels = torch.cat([ep.labels for ep in historical_episodes])
-        frozen_be = pretrain_binding_encoder(
-            data["protein"].x, drug_features,
-            all_edges, all_labels,
-            epochs=args.pretrain_epochs,
-            device=device,
-            lr=args.pretrain_lr,
-            hidden=args.token_dim,
-            extra_epochs=args.pretrain_extra_epochs,
-            global_mean=global_mean_affinity,
-        )
-        print("BindingEncoder pretrained and frozen.")
+
+        if args.gnn_prior != "none":
+            gnn_label_offset = args.gnn_label_offset if args.gnn_label_offset is not None else global_mean_affinity
+            print(f"\nPretraining GNN prior ({args.gnn_prior}) on {len(historical_episodes)} historical proteins "
+                  f"(label_offset={gnn_label_offset:.3f})...")
+            gnn_prior = pretrain_gnn(
+                gnn_kind=args.gnn_prior,
+                data=data,
+                hist_edges=all_edges,
+                hist_labels=all_labels,
+                epochs=args.gnn_pretrain_epochs,
+                device=device,
+                lr=args.gnn_pretrain_lr,
+                hidden=args.gnn_hidden,
+                label_offset=gnn_label_offset,
+            )
+        else:
+            print(f"\nPretraining BindingEncoder on {len(historical_episodes)} historical proteins...")
+            frozen_be = pretrain_binding_encoder(
+                data["protein"].x, drug_features,
+                all_edges, all_labels,
+                epochs=args.pretrain_epochs,
+                device=device,
+                lr=args.pretrain_lr,
+                hidden=args.token_dim,
+                extra_epochs=args.pretrain_extra_epochs,
+                global_mean=global_mean_affinity,
+            )
+            print("BindingEncoder pretrained and frozen.")
 
         print("Populating GP history with residuals from historical proteins...")
         for ep in historical_episodes:
-            prot_feats = data["protein"].x[ep.edges[0]]
-            drug_feats_ep = drug_features[ep.edges[1]]
-            store_labels = compute_residuals(frozen_be, prot_feats, drug_feats_ep, ep.labels, global_mean_affinity)
+            store_labels = compute_residuals(
+                frozen_be, data["protein"].x[ep.edges[0]], drug_features[ep.edges[1]],
+                ep.labels, global_mean_affinity,
+                gnn_prior=gnn_prior,
+                protein_indices=ep.edges[0],
+                drug_indices=ep.edges[1],
+            )
             gp_builder.add_revealed(ep.edges, store_labels)
         print(f"GP history populated with {all_labels.size(0)} residual bindings.")
 
@@ -911,6 +1107,7 @@ def main():
     print(f"  per-query-k:     {args.per_query_k} {'(dynamic context)' if args.per_query_k > 0 else '(shared context)'}")
     print(f"  neighbor-k:      {args.neighbor_k}")
     print(f"  historical frac: {args.historical_protein_frac:.0%}")
+    print(f"  gnn prior:       {args.gnn_prior}")
     print(f"  cold-start only: {args.cold_start_only}")
     print("-" * 72)
 
@@ -938,7 +1135,9 @@ def main():
     train_scope_upgraded = False
     total_episode_budget = len(historical_episodes) + len(stream_episodes)
 
-    if historical_episodes and frozen_be is None:
+    # Skip historical optimization loop when a prior was pretrained — gp_builder is already
+    # pre-populated with residuals and the GNN/BindingEncoder prior handles cold-start.
+    if historical_episodes and frozen_be is None and gnn_prior is None:
         print("\nConsuming historical split before streamed evaluation...")
         for hist_i, ep in enumerate(historical_episodes):
             loader.begin_episode(hist_i)
@@ -959,7 +1158,7 @@ def main():
                     model, loss_fn, optimizer, gp_builder, drug_features,
                     pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                     global_mean_affinity, args.replay_weight, hist_i, total_episode_budget,
-                    frozen_be=frozen_be,
+                    frozen_be=frozen_be, gnn_prior=gnn_prior,
                 )
             else:
                 optimize_episode(
@@ -1011,7 +1210,7 @@ def main():
             if gp_builder is not None:
                 mu_eval, sigma_eval, eval_stats = run_episode_gp(
                     model, gp_builder, drug_features, pillar, ep.edges[1], global_mean_affinity,
-                    frozen_be=frozen_be,
+                    frozen_be=frozen_be, gnn_prior=gnn_prior,
                 )
             else:
                 mu_eval, sigma_eval, eval_stats = run_episode(
@@ -1049,7 +1248,7 @@ def main():
                 model, loss_fn, optimizer, gp_builder, drug_features,
                 pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                 global_mean_affinity, args.replay_weight, global_episode_idx, total_episode_budget,
-                frozen_be=frozen_be,
+                frozen_be=frozen_be, gnn_prior=gnn_prior,
             )
         else:
             train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(
@@ -1062,7 +1261,12 @@ def main():
         if gp_builder is not None:
             prot_feats = data["protein"].x[ep.edges[0]]
             drug_feats_ep = drug_features[ep.edges[1]]
-            store_labels = compute_residuals(frozen_be, prot_feats, drug_feats_ep, ep.labels, global_mean_affinity)
+            store_labels = compute_residuals(
+                frozen_be, prot_feats, drug_feats_ep, ep.labels, global_mean_affinity,
+                gnn_prior=gnn_prior,
+                protein_indices=ep.edges[0],
+                drug_indices=ep.edges[1],
+            )
             gp_builder.add_revealed(ep.edges, store_labels)
         replay_buffer.add(ep.protein_idx, pillar["target_features"])
         history_after = loader.history_stats()
