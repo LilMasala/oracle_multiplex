@@ -159,6 +159,14 @@ class GPAffinityModel(nn.Module):
         nn.init.zeros_(self.output_head[-1].weight)
         nn.init.zeros_(self.output_head[-1].bias)
 
+        # Context quality gate: how much to trust GP vs. prior.
+        # Reads the attended representation → scalar alpha in (0,1).
+        # Bias init at -2 → sigmoid(-2) ≈ 0.12, so model starts near pure prior
+        # and learns to open the gate as context proves reliable.
+        self.ctx_gate = nn.Linear(out_dim, 1)
+        nn.init.zeros_(self.ctx_gate.weight)
+        nn.init.constant_(self.ctx_gate.bias, -2.0)
+
         self.last_forward_stats = {}
 
     def forward(
@@ -218,7 +226,11 @@ class GPAffinityModel(nn.Module):
 
         # mu = prior + GP residual transfer + correction when context available; prior otherwise.
         # Context stores residuals (label - prior), so we must add prior back to get absolute scale.
-        mu_ctx = prior + transfer + mu_residual
+        # alpha gates how much to trust the GP vs. the prior — learned from attended representation.
+        # When context is noisy (e.g. level-3 neighborhood fallback for unrelated drugs),
+        # the gate learns to stay near 0, keeping predictions anchored to the prior.
+        alpha = torch.sigmoid(self.ctx_gate(attended)).squeeze(-1)  # [n_qry]
+        mu_ctx = prior + alpha * (transfer + mu_residual)
         mu = torch.where(has_ctx, mu_ctx, prior)
 
         sigma = F.softplus(log_sigma) + 1e-4

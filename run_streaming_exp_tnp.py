@@ -147,12 +147,15 @@ class GNNPrior:
         self.drug_embeddings = drug_embeddings.cpu()        # [N_drug, h]
         self.label_offset = label_offset
         self.device = device
+        self._cached_z = None  # lazily populated on first call
 
     def _z_dict(self):
-        return {
-            "protein": self.protein_embeddings.to(self.device),
-            "drug": self.drug_embeddings.to(self.device),
-        }
+        if self._cached_z is None:
+            self._cached_z = {
+                "protein": self.protein_embeddings.to(self.device),
+                "drug": self.drug_embeddings.to(self.device),
+            }
+        return self._cached_z
 
     @torch.no_grad()
     def predict(self, protein_idx: int, drug_indices: torch.Tensor) -> torch.Tensor:
@@ -452,6 +455,10 @@ def build_arg_parser():
                         help="Hidden dimension for GNN prior")
     parser.add_argument("--gnn-label-offset", type=float, default=None,
                         help="Label offset for GNN prior (default: global_mean_affinity)")
+    parser.add_argument("--gnn-prior-save", type=str, default=None,
+                        help="Path to save the pretrained GNN prior (e.g. gnn_prior.pt)")
+    parser.add_argument("--gnn-prior-load", type=str, default=None,
+                        help="Path to load a previously saved GNN prior; skips pretraining")
     parser.add_argument(
         "--mol-prior-dir",
         type=str,
@@ -1088,19 +1095,48 @@ def main():
             )
         elif args.gnn_prior in ("sage", "ranker"):
             gnn_label_offset = args.gnn_label_offset if args.gnn_label_offset is not None else global_mean_affinity
-            print(f"\nPretraining GNN prior ({args.gnn_prior}) on {len(historical_episodes)} historical proteins "
-                  f"(label_offset={gnn_label_offset:.3f})...")
-            gnn_prior = pretrain_gnn(
-                gnn_kind=args.gnn_prior,
-                data=data,
-                hist_edges=all_edges,
-                hist_labels=all_labels,
-                epochs=args.gnn_pretrain_epochs,
-                device=device,
-                lr=args.gnn_pretrain_lr,
-                hidden=args.gnn_hidden,
-                label_offset=gnn_label_offset,
-            )
+            if args.gnn_prior_load is not None:
+                print(f"\nLoading GNN prior from {args.gnn_prior_load}...")
+                ckpt = torch.load(args.gnn_prior_load, weights_only=False, map_location=device)
+                gnn_prior = pretrain_gnn(
+                    gnn_kind=ckpt["gnn_kind"],
+                    data=data,
+                    hist_edges=all_edges,
+                    hist_labels=all_labels,
+                    epochs=0,
+                    device=device,
+                    hidden=ckpt["hidden"],
+                    label_offset=float(ckpt["label_offset"]),
+                )
+                gnn_prior.gnn.load_state_dict(ckpt["model_state"])
+                gnn_prior.protein_embeddings = ckpt["protein_embeddings"]
+                gnn_prior.drug_embeddings = ckpt["drug_embeddings"]
+                gnn_prior._cached_z = None
+                print("GNN prior loaded.")
+            else:
+                print(f"\nPretraining GNN prior ({args.gnn_prior}) on {len(historical_episodes)} historical proteins "
+                      f"(label_offset={gnn_label_offset:.3f})...")
+                gnn_prior = pretrain_gnn(
+                    gnn_kind=args.gnn_prior,
+                    data=data,
+                    hist_edges=all_edges,
+                    hist_labels=all_labels,
+                    epochs=args.gnn_pretrain_epochs,
+                    device=device,
+                    lr=args.gnn_pretrain_lr,
+                    hidden=args.gnn_hidden,
+                    label_offset=gnn_label_offset,
+                )
+                if args.gnn_prior_save is not None:
+                    torch.save({
+                        "gnn_kind": args.gnn_prior,
+                        "hidden": args.gnn_hidden,
+                        "label_offset": gnn_label_offset,
+                        "model_state": gnn_prior.gnn.state_dict(),
+                        "protein_embeddings": gnn_prior.protein_embeddings,
+                        "drug_embeddings": gnn_prior.drug_embeddings,
+                    }, args.gnn_prior_save)
+                    print(f"GNN prior saved to {args.gnn_prior_save}.")
         else:
             print(f"\nPretraining BindingEncoder on {len(historical_episodes)} historical proteins...")
             frozen_be = pretrain_binding_encoder(
