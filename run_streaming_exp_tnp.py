@@ -421,6 +421,7 @@ def build_arg_parser():
     parser.add_argument("--enable-synthetic-prior", action="store_true", help="Inject synthetic prior token at cold-start")
     parser.add_argument("--drug-analogs", action="store_true", help="Enable drug analog context injection")
     parser.add_argument("--analog-top-k", type=int, default=32, help="Top-K analogues per drug")
+    parser.add_argument("--nb-role-boost", type=float, default=1.0, help="k_prot override for GO-similar (role) neighbors in GP context retrieval")
     parser.add_argument("--use-go", action="store_true", help="Inject GO anc2vec fingerprints into the protein encoder")
     parser.add_argument("--per-query-k", type=int, default=0, help="Per-query context size (>0 enables dynamic context)")
     parser.add_argument("--use-gnn", action="store_true", help="Backward-compatible shortcut for --gnn-mode frozen")
@@ -574,6 +575,9 @@ def save_checkpoint(path, *, model, optimizer, frozen_be, gp_builder, replay_buf
         "ef10_history": ef10_history,
         "regime_counts": regime_counts,
         "drug_to_bindings": dict(gp_builder._drug_to_bindings) if gp_builder is not None else None,
+        "gp_pool_prot": list(gp_builder._pool_prot) if gp_builder is not None else None,
+        "gp_pool_drug": list(gp_builder._pool_drug) if gp_builder is not None else None,
+        "gp_pool_aff":  list(gp_builder._pool_aff)  if gp_builder is not None else None,
         "replay_indices": list(replay_buffer._indices),
         "replay_sketches": [s.cpu() for s in replay_buffer._sketches],
     }
@@ -590,6 +594,9 @@ def load_checkpoint(path, *, model, optimizer, frozen_be, gp_builder, replay_buf
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if gp_builder is not None and ckpt.get("drug_to_bindings") is not None:
         gp_builder._drug_to_bindings = defaultdict(list, {int(k): v for k, v in ckpt["drug_to_bindings"].items()})
+        gp_builder._pool_prot = ckpt.get("gp_pool_prot") or []
+        gp_builder._pool_drug = ckpt.get("gp_pool_drug") or []
+        gp_builder._pool_aff  = ckpt.get("gp_pool_aff")  or []
     if frozen_be is not None and "frozen_be_state_dict" in ckpt:
         frozen_be.load_state_dict(ckpt["frozen_be_state_dict"])
     replay_buffer._indices = ckpt["replay_indices"]
@@ -783,6 +790,7 @@ def run_episode_gp(
     global_mean_affinity: float = 6.5,
     frozen_be=None,
     gnn_prior: "GNNPrior | None" = None,
+    role_boost: float = 1.0,
 ):
     target = pillar["target_features"]
     target_idx = int(pillar["target_idx"])
@@ -792,22 +800,14 @@ def run_episode_gp(
     qry_protein = target.unsqueeze(0).expand(n_qry, -1)
     qry_drug = drug_features[query_drug_indices]
 
-    ctx_proteins, ctx_affinities, ctx_mask = gp_builder.build_context(
-        target_idx, query_drug_indices, device
-    )
-    # When a prior is active, GP history stores residuals (label - prior).
-    # Level-3 pool uses raw labels from loader, so subtract global_mean to centre.
-    has_prior = frozen_be is not None or gnn_prior is not None
-    fallback_offset = global_mean_affinity if has_prior else 0.0
-    gp_builder.apply_neighborhood_fallback(
-        pillar, query_drug_indices, ctx_proteins, ctx_affinities, ctx_mask, device,
-        affinity_offset=fallback_offset,
+    ctx_proteins, ctx_drugs, ctx_affinities, ctx_mask = gp_builder.build_context(
+        target_idx, query_drug_indices, device, pillar=pillar, role_boost=role_boost,
     )
     prior = compute_prior(
         frozen_be, qry_protein, qry_drug, global_mean_affinity,
         gnn_prior=gnn_prior, protein_idx=target_idx, drug_indices=query_drug_indices,
     )
-    mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_affinities, ctx_mask, prior)
+    mu, sigma = model(qry_protein, qry_drug, ctx_proteins, ctx_drugs, ctx_affinities, ctx_mask, prior)
 
     stats = collect_forward_stats(model)
     stats["n_ctx"] = int(ctx_mask.float().sum(dim=1).mean().item())
@@ -832,6 +832,7 @@ def optimize_episode_gp(
     replay_edges_per_protein: int = 256,
     frozen_be=None,
     gnn_prior: "GNNPrior | None" = None,
+    role_boost: float = 1.0,
 ):
     train_loss = nll_val = replay_loss_val = float("nan")
     w_nll = w_listnet = w_lambda = float("nan")
@@ -846,7 +847,7 @@ def optimize_episode_gp(
 
     mu, sigma, _ = run_episode_gp(
         model, gp_builder, drug_features, pillar, query_drug_indices, global_mean_affinity,
-        frozen_be=frozen_be, gnn_prior=gnn_prior,
+        frozen_be=frozen_be, gnn_prior=gnn_prior, role_boost=role_boost,
     )
     result = loss_fn(mu, sigma, labels.to(query_drug_indices.device))
     result["total_loss"].backward()
@@ -864,7 +865,7 @@ def optimize_episode_gp(
         for _, replay_edges, replay_labels, replay_pillar in replay_batches:
             r_mu, r_sigma, _ = run_episode_gp(
                 model, gp_builder, drug_features, replay_pillar, replay_edges[1], global_mean_affinity,
-                frozen_be=frozen_be, gnn_prior=gnn_prior,
+                frozen_be=frozen_be, gnn_prior=gnn_prior, role_boost=role_boost,
             )
             r_result = loss_fn(r_mu, r_sigma, replay_labels.to(query_drug_indices.device))
             replay_total = replay_total + r_result["total_loss"]
@@ -1057,9 +1058,7 @@ def main():
         gp_builder = DrugFirstContextBuilder(
             protein_features=data["protein"].x,
             drug_features=drug_features,
-            drug_analog_index=drug_analog_index,
             max_k=args.max_context,
-            analog_min_sim=0.5,
         )
 
     frozen_be = None
@@ -1227,7 +1226,7 @@ def main():
                     model, loss_fn, optimizer, gp_builder, drug_features,
                     pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                     global_mean_affinity, args.replay_weight, hist_i, total_episode_budget,
-                    frozen_be=frozen_be, gnn_prior=gnn_prior,
+                    frozen_be=frozen_be, gnn_prior=gnn_prior, role_boost=args.nb_role_boost,
                 )
             else:
                 optimize_episode(
@@ -1279,7 +1278,7 @@ def main():
             if gp_builder is not None:
                 mu_eval, sigma_eval, eval_stats = run_episode_gp(
                     model, gp_builder, drug_features, pillar, ep.edges[1], global_mean_affinity,
-                    frozen_be=frozen_be, gnn_prior=gnn_prior,
+                    frozen_be=frozen_be, gnn_prior=gnn_prior, role_boost=args.nb_role_boost,
                 )
             else:
                 mu_eval, sigma_eval, eval_stats = run_episode(
@@ -1317,7 +1316,7 @@ def main():
                 model, loss_fn, optimizer, gp_builder, drug_features,
                 pillar, ep.edges[1], ep.labels, replay_buffer, loader,
                 global_mean_affinity, args.replay_weight, global_episode_idx, total_episode_budget,
-                frozen_be=frozen_be, gnn_prior=gnn_prior,
+                frozen_be=frozen_be, gnn_prior=gnn_prior, role_boost=args.nb_role_boost,
             )
         else:
             train_loss, nll_val, replay_loss_val, w_nll, w_listnet, w_lambda = optimize_episode(

@@ -6,14 +6,16 @@ Architecture:
   CrossAttentionLayer     query protein attends to context proteins, drug-conditionally
   GPAffinityModel         GP transfer + correction head; prior supplied by caller
 
-Inference cascade:
-  Level 1: D's exact binding profile {(protX, affinity)}
-  Level 2: D' analog profiles {(protX, affinity × drug_sim)}, D' ~ D
-  Level 3: no context → caller-supplied prior (frozen BindingEncoder output + global mean)
+Cross-pair kernel:
+  k((A, D), (X, Y)) = enc(A, D)^T enc(X, Y) / sqrt(d)
+
+Context is retrieved by product kernel k_prot(A,X) × k_drug(D,Y) and passed as
+(ctx_proteins, ctx_drugs, ctx_affinities) — the observation drug Y for each context
+slot is passed explicitly so the kernel is evaluated correctly.
 
 The cross-attention approximates the GP posterior mean:
   μ(A) = k_D(A, X) [K_D(X,X) + σ²I]⁻¹ y
-where k_D is the drug-conditional deep kernel learned by DrugConditionalEncoder.
+where k((A,D),(X,Y)) = enc(A,D)^T enc(X,Y) is the cross-pair deep kernel.
 """
 
 from __future__ import annotations
@@ -115,15 +117,14 @@ class GPAffinityModel(nn.Module):
     Binding affinity predictor via drug-conditioned GP approximation.
 
     Forward pass:
-      1. Encode query and context proteins drug-conditionally (deep kernel).
-      2. GP transfer: single-head attention over scalar affinities →
-         approximates GP posterior mean μ(A) = k_D(A,X)[K_D(X,X)+σ²I]⁻¹y.
-      3. Correction: multi-layer cross-attention builds an attended
-         representation; correction_head reads (query_emb, attended) →
-         nonlinear residual for where A diverges from context in ways D cares
-         about.
-      4. Fallback: when no context, uses caller-supplied prior
-         (frozen_binding_encoder(qry_protein, qry_drug) + global_mean_affinity).
+      1. Encode query (A,D) and context (X_i,Y_i) pairs drug-conditionally:
+         Q = enc(A,D),  K_i = enc(X_i, Y_i)  — cross-pair deep kernel.
+      2. GP transfer: single-head attention Q·K_i^T / sqrt(d) over residual affinities
+         approximates GP posterior mean k((A,D),(X,Y)) [K+σ²I]⁻¹ residuals.
+      3. Correction: multi-layer cross-attention builds an attended representation;
+         correction_head reads (query_emb, attended) → nonlinear residual.
+      4. ctx_gate: learned alpha gates GP contribution vs. prior.
+      5. Fallback: when no context, uses caller-supplied prior.
     """
 
     def __init__(
@@ -174,7 +175,8 @@ class GPAffinityModel(nn.Module):
         qry_protein: torch.Tensor,     # [n_qry, protein_dim]
         qry_drug: torch.Tensor,        # [n_qry, drug_dim]
         ctx_proteins: torch.Tensor,    # [n_qry, K, protein_dim]
-        ctx_affinities: torch.Tensor,  # [n_qry, K]  (drug_sim-scaled at level 2)
+        ctx_drugs: torch.Tensor,       # [n_qry, K, drug_dim]  observation drug for each context slot
+        ctx_affinities: torch.Tensor,  # [n_qry, K]  residuals (label - prior), unscaled
         ctx_mask: torch.Tensor,        # [n_qry, K] bool, True = valid
         prior: torch.Tensor,           # [n_qry] precomputed by caller as frozen_binding_encoder(qry_protein, qry_drug) + global_mean_affinity
     ):
@@ -189,12 +191,12 @@ class GPAffinityModel(nn.Module):
         Q = self.encoder(qry_protein, qry_drug)  # [n_qry, out_dim]
 
         if K > 0:
-            # Drug-conditional context encoding
-            # Each context protein is encoded through the lens of its query drug
-            qry_drug_exp = qry_drug.unsqueeze(1).expand(-1, K, -1).reshape(n_qry * K, -1)
+            # Drug-conditional context encoding using the OBSERVATION drug for each slot.
+            # Cross-pair kernel: k((A,D),(X,Y)) = enc(A,D)^T enc(X,Y) — requires enc(X,Y),
+            # not enc(X, D_query). Using the query drug here was the original bug.
             K_emb = self.encoder(
                 ctx_proteins.reshape(n_qry * K, -1),
-                qry_drug_exp,
+                ctx_drugs.reshape(n_qry * K, -1),
             ).view(n_qry, K, self.out_dim)  # [n_qry, K, out_dim]
 
             # GP transfer: single-head attention weights over scalar affinities
@@ -253,11 +255,12 @@ if __name__ == "__main__":
     qry_p = torch.randn(n_qry, prot_dim)
     qry_d = torch.randn(n_qry, drug_dim)
     ctx_p = torch.randn(n_qry, K, prot_dim)
+    ctx_d = torch.randn(n_qry, K, drug_dim)
     ctx_a = torch.randn(n_qry, K)
     ctx_m = torch.ones(n_qry, K, dtype=torch.bool)
     prior = torch.full((n_qry,), 6.5)
 
-    mu, sigma = model(qry_p, qry_d, ctx_p, ctx_a, ctx_m, prior=prior)
+    mu, sigma = model(qry_p, qry_d, ctx_p, ctx_d, ctx_a, ctx_m, prior=prior)
     assert mu.shape == (n_qry,)
     assert sigma.shape == (n_qry,)
     assert (sigma > 0).all()
@@ -265,7 +268,7 @@ if __name__ == "__main__":
 
     # Cold-start: all mask False
     cold_mask = torch.zeros(n_qry, K, dtype=torch.bool)
-    mu0, sigma0 = model(qry_p, qry_d, ctx_p, ctx_a, cold_mask, prior=prior)
+    mu0, sigma0 = model(qry_p, qry_d, ctx_p, ctx_d, ctx_a, cold_mask, prior=prior)
     assert mu0.shape == (n_qry,)
     assert (sigma0 > 0).all()
     print(f"Cold: mu={mu0.mean():.3f} sigma={sigma0.mean():.3f} — PASSED")
@@ -274,6 +277,7 @@ if __name__ == "__main__":
     mu1, sigma1 = model(
         qry_p, qry_d,
         torch.zeros(n_qry, 0, prot_dim),
+        torch.zeros(n_qry, 0, drug_dim),
         torch.zeros(n_qry, 0),
         torch.zeros(n_qry, 0, dtype=torch.bool),
         prior=prior,
