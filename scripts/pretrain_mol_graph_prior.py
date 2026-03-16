@@ -28,6 +28,7 @@ import sys
 
 import torch
 import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -110,6 +111,7 @@ def main(args):
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
+    scaler = GradScaler()
 
     pg_ei_dev = pg_ei.to(device)
 
@@ -125,13 +127,15 @@ def main(args):
             labels     = batch["labels"].to(device)
 
             # forward: p is [B, h], d is [B, h]
-            p, d = model(prot_batch, drug_batch, pg_ei_dev, num_proteins, prot_ids)
-
-            scores = model.scorer(p, d)
-            loss   = F.mse_loss(scores, labels)
-            loss.backward()
+            with autocast("cuda"):
+                p, d = model(prot_batch, drug_batch, pg_ei_dev, num_proteins, prot_ids)
+                scores = model.scorer(p, d)
+                loss   = F.mse_loss(scores, labels)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             bs = labels.size(0)
             epoch_loss += float(loss.detach()) * bs
