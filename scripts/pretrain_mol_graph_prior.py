@@ -97,6 +97,24 @@ def main(args):
     print(f"Training edges after drug-graph filter: {ei.size(1)}/{n_before} "
           f"({100*ei.size(1)/n_before:.1f}%)")
 
+    # 3b. Filter to historical proteins only (prevents leakage into streaming eval set)
+    if args.historical_protein_frac > 0.0:
+        from src.protocol.prequential import build_multiplex_stream
+        _all_eps = build_multiplex_stream(
+            data, binds_metric="binds_activity",
+            min_edges=args.stream_min_edges, seed=args.stream_seed,
+        )
+        _hist_count = int(len(_all_eps) * args.historical_protein_frac)
+        hist_prot_set = {int(ep.protein_idx) for ep in _all_eps[:_hist_count]}
+        print(f"Historical protein filter: {len(hist_prot_set)} proteins "
+              f"({args.historical_protein_frac:.0%} of {len(_all_eps)}-episode stream)")
+        hist_mask = torch.tensor(
+            [int(ei[0, i]) in hist_prot_set for i in range(ei.size(1))], dtype=torch.bool
+        )
+        ei = ei[:, hist_mask]
+        shifted_el = shifted_el[hist_mask]
+        print(f"Training edges after historical filter: {ei.size(1)}")
+
     # Build dataset + dataloader
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
@@ -199,4 +217,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr",                  type=float, default=1e-3)
     parser.add_argument("--bilinear-rank",       type=int, default=128)
     parser.add_argument("--embed-batch-size",    type=int, default=512)
+    parser.add_argument("--historical-protein-frac", type=float, default=0.0,
+                        help="Fraction of stream proteins to train on (0.0=all). "
+                             "Must match --historical-protein-frac in run_streaming_exp_tnp.py")
+    parser.add_argument("--stream-seed",         type=int, default=42,
+                        help="Protein stream shuffle seed (must match --seed in streaming exp)")
+    parser.add_argument("--stream-min-edges",    type=int, default=15,
+                        help="min_edges for build_multiplex_stream (must match streaming exp)")
     main(parser.parse_args())
