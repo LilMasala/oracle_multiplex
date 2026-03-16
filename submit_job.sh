@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=oracle_gp
-#SBATCH --partition=exx96
+#SBATCH --partition=mwgpu256
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16

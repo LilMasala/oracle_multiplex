@@ -111,9 +111,8 @@ def main(args):
             prot_ids   = batch["prot_ids"].to(device)
             labels     = batch["labels"].to(device)
 
-            # forward: p_full is [num_proteins, h], d is [B_drug, h]
-            p_full, d = model(prot_batch, drug_batch, pg_ei_dev, num_proteins)
-            p = p_full[prot_ids]  # index rows for this mini-batch's proteins -> [B, h]
+            # forward: p is [B, h], d is [B, h]
+            p, d = model(prot_batch, drug_batch, pg_ei_dev, num_proteins, prot_ids)
 
             scores = model.scorer(p, d)
             loss   = F.mse_loss(scores, labels)

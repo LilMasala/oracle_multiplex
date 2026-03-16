@@ -57,7 +57,7 @@ class GOEnricher(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, prot_emb, go_x, pg_edge_index, num_proteins) -> Tensor:
+    def forward(self, prot_emb, go_x, pg_edge_index, num_proteins, prot_indices=None) -> Tensor:
         go_h = F.relu(self.go_proj(go_x))
         go_agg = scatter(
             go_h[pg_edge_index[1]], pg_edge_index[0],
@@ -66,6 +66,9 @@ class GOEnricher(nn.Module):
         ones = torch.ones(pg_edge_index.size(1), device=prot_emb.device)
         count = scatter(ones, pg_edge_index[0], dim=0, dim_size=num_proteins, reduce='sum')
         go_present = (count > 0).float().unsqueeze(-1)
+        if prot_indices is not None:
+            go_agg = go_agg[prot_indices]
+            go_present = go_present[prot_indices]
         fused = self.fuse(torch.cat([prot_emb, go_agg], dim=-1))
         return self.norm(prot_emb + go_present * fused)
 
@@ -107,6 +110,7 @@ class MolGraphPrior(nn.Module):
         drug_batch: Batch,
         pg_edge_index: Tensor,
         num_proteins: int,
+        prot_indices=None,
     ) -> Tuple[Tensor, Tensor]:
         p_raw = self.prot_enc(
             prot_batch.x, prot_batch.edge_index, prot_batch.edge_attr, prot_batch.batch
@@ -114,8 +118,8 @@ class MolGraphPrior(nn.Module):
         d = self.drug_enc(
             drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr, drug_batch.batch
         )
-        p_full = self.go_enr(p_raw, self.go_emb.weight, pg_edge_index, num_proteins)
-        return p_full, d
+        p_emb = self.go_enr(p_raw, self.go_emb.weight, pg_edge_index, num_proteins, prot_indices)
+        return p_emb, d
 
     def predict_links(
         self,
