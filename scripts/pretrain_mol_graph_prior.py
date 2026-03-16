@@ -80,7 +80,20 @@ def main(args):
         args.drug_tar_dir, data["drug"].chembl_id_to_index, args.drug_index
     )
 
-    # 3. Build dataset + dataloader
+    # 3. Filter to edges where both protein and drug graphs exist
+    drug_has_graph = {
+        idx for idx, cid in idx_to_chembl.items() if cid in drug_loader._index
+    }
+    valid = torch.tensor(
+        [int(ei[1, i]) in drug_has_graph for i in range(ei.size(1))],
+        dtype=torch.bool,
+    )
+    n_before = ei.size(1)
+    ei, shifted_el = ei[:, valid], shifted_el[valid]
+    print(f"Training edges after drug-graph filter: {ei.size(1)}/{n_before} "
+          f"({100*ei.size(1)/n_before:.1f}%)")
+
+    # Build dataset + dataloader
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
@@ -149,7 +162,10 @@ def main(args):
     print("Precomputing drug embeddings...")
     drug_emb_final = torch.zeros(num_drugs, args.hidden)
     for start in tqdm(range(0, num_drugs, args.embed_batch_size)):
-        chunk = range(start, min(start + args.embed_batch_size, num_drugs))
+        chunk = [i for i in range(start, min(start + args.embed_batch_size, num_drugs))
+                 if i in drug_has_graph]
+        if not chunk:
+            continue
         graphs = [drug_loader.get_by_idx(i) for i in chunk]
         db = Batch.from_data_list(graphs).to(device)
         with torch.no_grad():
