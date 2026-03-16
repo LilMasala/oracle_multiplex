@@ -18,6 +18,10 @@ Usage:
       --lr            1e-3 \
       --bilinear-rank 128 \
       --embed-batch-size 512
+
+Optional fast drug loading (avoids tar archive I/O):
+      --drug-packed-cache /path/to/drug_graphs_packed.pt
+  (generate with: python scripts/pack_drug_graphs.py ...)
 """
 
 from __future__ import annotations
@@ -57,18 +61,15 @@ def main(args):
     data = torch.load(args.hetero_data, weights_only=False)
     data = merge_activity_edges(data, reduce="amax")
 
-    ei    = data["protein", "binds_activity", "drug"].edge_index   # [2, N]
-    el    = data["protein", "binds_activity", "drug"].edge_label   # [N]
-    go_x  = data["go"].x                                           # [N_go, 200]
-    pg_ei = data["protein", "relates", "go"].edge_index            # [2, E_pg]
+    ei = data["protein", "binds_activity", "drug"].edge_index   # [2, N]
+    el = data["protein", "binds_activity", "drug"].edge_label   # [N]
 
     num_proteins = int(data["protein"].num_nodes)
     num_drugs    = int(data["drug"].num_nodes)
-    n_go         = int(go_x.size(0))
 
     label_offset = float(el.mean())
     shifted_el   = el - label_offset
-    print(f"Proteins: {num_proteins}, Drugs: {num_drugs}, GO: {n_go}")
+    print(f"Proteins: {num_proteins}, Drugs: {num_drugs}")
     print(f"Binding edges: {ei.size(1)}, label_offset: {label_offset:.4f}")
 
     # 2. Build loaders
@@ -79,10 +80,11 @@ def main(args):
     )
     drug_loader = DrugGraphTarLoader(
         args.drug_tar_dir, data["drug"].chembl_id_to_index, args.drug_index,
-        cache_in_memory=True,
+        cache_in_memory=(args.drug_packed_cache is None),
+        packed_cache_path=args.drug_packed_cache,
     )
 
-    # 3. Filter to edges where both protein and drug graphs exist
+    # 3. Filter to edges where drug graphs exist
     drug_has_graph = {
         idx for idx, cid in idx_to_chembl.items() if cid in drug_loader._index
     }
@@ -103,18 +105,14 @@ def main(args):
 
     # 4. Model
     model = MolGraphPrior(
-        n_go_terms=n_go, hidden=args.hidden, num_layers=args.num_layers,
+        hidden=args.hidden, num_layers=args.num_layers,
         bilinear_rank=args.bilinear_rank,
     ).to(device)
-    with torch.no_grad():
-        model.go_emb.weight.copy_(go_x.to(device))
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
     scaler = GradScaler()
-
-    pg_ei_dev = pg_ei.to(device)
 
     # 5. Training loop
     for epoch in range(1, args.epochs + 1):
@@ -124,12 +122,10 @@ def main(args):
             optimizer.zero_grad()
             prot_batch = batch["prot_batch"].to(device)
             drug_batch = batch["drug_batch"].to(device)
-            prot_ids   = batch["prot_ids"].to(device)
             labels     = batch["labels"].to(device)
 
-            # forward: p is [B, h], d is [B, h]
             with autocast("cuda"):
-                p, d = model(prot_batch, drug_batch, pg_ei_dev, num_proteins, prot_ids)
+                p, d = model(prot_batch, drug_batch)
                 scores = model.scorer(p, d)
                 loss   = F.mse_loss(scores, labels)
             scaler.scale(loss).backward()
@@ -146,24 +142,19 @@ def main(args):
         scheduler.step(epoch_loss)
         print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}")
 
-    # 6. Precompute protein embeddings (two-pass)
+    # 6. Precompute protein embeddings
     print("Precomputing protein embeddings...")
     model.eval()
-    raw_prot_embs = torch.zeros(num_proteins, args.hidden)
+    prot_emb_final = torch.zeros(num_proteins, args.hidden)
     for start in tqdm(range(0, num_proteins, args.embed_batch_size)):
         chunk = range(start, min(start + args.embed_batch_size, num_proteins))
         graphs = [prot_loader.get_by_idx(i) for i in chunk]
         pb = Batch.from_data_list(graphs).to(device)
         with torch.no_grad():
-            raw = model.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
-        raw_prot_embs[chunk] = raw.cpu()
+            emb = model.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
+        prot_emb_final[chunk] = emb.cpu()
 
-    with torch.no_grad():
-        prot_emb_final = model.go_enr(
-            raw_prot_embs.to(device), model.go_emb.weight, pg_ei_dev, num_proteins
-        ).cpu()
-
-    # 7. Precompute drug embeddings (chunked -- may take ~30min for 2M drugs)
+    # 7. Precompute drug embeddings
     print("Precomputing drug embeddings...")
     drug_emb_final = torch.zeros(num_drugs, args.hidden)
     for start in tqdm(range(0, num_drugs, args.embed_batch_size)):
@@ -186,7 +177,6 @@ def main(args):
         "label_offset":  label_offset,
         "hidden":        args.hidden,
         "bilinear_rank": args.bilinear_rank,
-        "n_go_terms":    n_go,
     }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
     print(f"Saved to {args.output_dir}")
 
@@ -195,28 +185,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Pretrain MolGraphPrior on protein-drug binding data"
     )
-    parser.add_argument("--hetero-data",      required=True,
-                        help="Path to final_graph_data_not_normalized.pt")
-    parser.add_argument("--protein-zip",      required=True,
-                        help="Path to protein_graphs.zip")
-    parser.add_argument("--drug-tar-dir",     required=True,
-                        help="Directory containing drug graph tar files")
-    parser.add_argument("--drug-index",       default=None,
-                        help="Path to drug_index.json (optional)")
-    parser.add_argument("--output-dir",       required=True,
-                        help="Directory to write mol_prior_model.pt and mol_prior_tables.pt")
-    parser.add_argument("--hidden",           type=int, default=256,
-                        help="Hidden dimension for GNN layers")
-    parser.add_argument("--num-layers",       type=int, default=4,
-                        help="Number of GINE layers")
-    parser.add_argument("--epochs",           type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument("--batch-size",       type=int, default=256,
-                        help="Mini-batch size for training")
-    parser.add_argument("--lr",               type=float, default=1e-3,
-                        help="Learning rate for Adam optimizer")
-    parser.add_argument("--bilinear-rank",    type=int, default=128,
-                        help="Rank of the bilinear scoring head")
-    parser.add_argument("--embed-batch-size", type=int, default=512,
-                        help="Batch size for precomputing embedding tables")
+    parser.add_argument("--hetero-data",        required=True)
+    parser.add_argument("--protein-zip",         required=True)
+    parser.add_argument("--drug-tar-dir",        required=True)
+    parser.add_argument("--drug-index",          default=None)
+    parser.add_argument("--drug-packed-cache",   default=None,
+                        help="Path to drug_graphs_packed.pt (faster than tar loading)")
+    parser.add_argument("--output-dir",          required=True)
+    parser.add_argument("--hidden",              type=int, default=256)
+    parser.add_argument("--num-layers",          type=int, default=4)
+    parser.add_argument("--epochs",              type=int, default=50)
+    parser.add_argument("--batch-size",          type=int, default=256)
+    parser.add_argument("--lr",                  type=float, default=1e-3)
+    parser.add_argument("--bilinear-rank",       type=int, default=128)
+    parser.add_argument("--embed-batch-size",    type=int, default=512)
     main(parser.parse_args())

@@ -1073,7 +1073,6 @@ def main():
                 os.path.join(args.mol_prior_dir, "mol_prior_tables.pt"), weights_only=False
             )
             _mol_model = MolGraphPrior(
-                n_go_terms=int(tables["n_go_terms"]),
                 hidden=int(tables["hidden"]),
                 bilinear_rank=int(tables["bilinear_rank"]),
             ).to(device)

@@ -6,7 +6,6 @@ from typing import Tuple
 from torch_geometric.nn import GINEConv
 from torch_geometric.nn import global_mean_pool
 from torch_geometric.data import Batch
-from torch_geometric.utils import scatter
 
 
 class GINEEncoder(nn.Module):
@@ -47,32 +46,6 @@ class DrugGraphEncoder(GINEEncoder):
         super().__init__(node_in, edge_in, hidden, num_layers, dropout)
 
 
-class GOEnricher(nn.Module):
-    def __init__(self, go_dim=200, hidden=256):
-        super().__init__()
-        self.go_proj = nn.Linear(go_dim, hidden)
-        self.fuse = nn.Sequential(
-            nn.Linear(hidden * 2, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden)
-        )
-        self.norm = nn.LayerNorm(hidden)
-
-    def forward(self, prot_emb, go_x, pg_edge_index, num_proteins, prot_indices=None) -> Tensor:
-        go_h = F.relu(self.go_proj(go_x))
-        go_agg = scatter(
-            go_h[pg_edge_index[1]], pg_edge_index[0],
-            dim=0, dim_size=num_proteins, reduce='mean'
-        )
-        ones = torch.ones(pg_edge_index.size(1), device=prot_emb.device)
-        count = scatter(ones, pg_edge_index[0], dim=0, dim_size=num_proteins, reduce='sum')
-        go_present = (count > 0).float().unsqueeze(-1)
-        if prot_indices is not None:
-            go_agg = go_agg[prot_indices]
-            go_present = go_present[prot_indices]
-        fused = self.fuse(torch.cat([prot_emb, go_agg], dim=-1))
-        return self.norm(prot_emb + go_present * fused)
-
-
 class BilinearScoringHead(nn.Module):
     def __init__(self, hidden=256, rank=128):
         super().__init__()
@@ -90,36 +63,31 @@ class MolGraphPrior(nn.Module):
         prot_edge_in=13,
         drug_node_in=20,
         drug_edge_in=5,
-        go_dim=200,
-        n_go_terms: int = 1,
         hidden=256,
         num_layers=4,
         bilinear_rank=128,
         dropout=0.1,
+        # Legacy kwargs ignored — GO enrichment removed
+        go_dim=200,
+        n_go_terms=1,
     ):
         super().__init__()
         self.prot_enc = ProteinGraphEncoder(prot_node_in, prot_edge_in, hidden, num_layers, dropout)
         self.drug_enc = DrugGraphEncoder(drug_node_in, drug_edge_in, hidden, num_layers, dropout)
-        self.go_emb = nn.Embedding(n_go_terms, go_dim)
-        self.go_enr = GOEnricher(go_dim=go_dim, hidden=hidden)
         self.scorer = BilinearScoringHead(hidden=hidden, rank=bilinear_rank)
 
     def forward(
         self,
         prot_batch: Batch,
         drug_batch: Batch,
-        pg_edge_index: Tensor,
-        num_proteins: int,
-        prot_indices=None,
     ) -> Tuple[Tensor, Tensor]:
-        p_raw = self.prot_enc(
+        p = self.prot_enc(
             prot_batch.x, prot_batch.edge_index, prot_batch.edge_attr, prot_batch.batch
         )
         d = self.drug_enc(
             drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr, drug_batch.batch
         )
-        p_emb = self.go_enr(p_raw, self.go_emb.weight, pg_edge_index, num_proteins, prot_indices)
-        return p_emb, d
+        return p, d
 
     def predict_links(
         self,
@@ -134,7 +102,7 @@ class MolGraphPrior(nn.Module):
 if __name__ == "__main__":
     from torch_geometric.data import Data, Batch
 
-    N_prot, N_drug, N_go = 4, 8, 20
+    N_prot, N_drug = 4, 8
     prot_graphs = [
         Data(x=torch.randn(10, 11),
              edge_index=torch.zeros(2, 0, dtype=torch.long),
@@ -147,14 +115,13 @@ if __name__ == "__main__":
              edge_attr=torch.zeros(0, 5))
         for _ in range(N_drug)
     ]
-    model = MolGraphPrior(n_go_terms=N_go)
+    model = MolGraphPrior()
     pb = Batch.from_data_list(prot_graphs)
     db = Batch.from_data_list(drug_graphs)
-    pg_ei = torch.zeros(2, 0, dtype=torch.long)
-    p_full, d = model(pb, db, pg_ei, N_prot)
-    assert p_full.shape == (N_prot, 256), f"Expected ({N_prot}, 256), got {p_full.shape}"
+    p, d = model(pb, db)
+    assert p.shape == (N_prot, 256), f"Expected ({N_prot}, 256), got {p.shape}"
     assert d.shape == (N_drug, 256), f"Expected ({N_drug}, 256), got {d.shape}"
-    z = {"protein": p_full, "drug": d}
+    z = {"protein": p, "drug": d}
     ei = torch.tensor([[0, 1], [0, 1]])
     scores = model.predict_links(z, ei)
     assert scores.shape == (2,), f"Expected (2,), got {scores.shape}"

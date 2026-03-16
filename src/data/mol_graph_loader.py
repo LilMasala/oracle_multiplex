@@ -49,7 +49,7 @@ class ProteinGraphZipLoader:
 # Always use num_workers=0 when constructing a DataLoader with MolGraphDataset.
 class DrugGraphTarLoader:
     def __init__(self, tar_dir: str, chembl_to_idx: dict, index_path: Optional[str] = None,
-                 cache_in_memory: bool = False):
+                 cache_in_memory: bool = False, packed_cache_path: Optional[str] = None):
         if index_path is not None and os.path.isfile(index_path):
             with open(index_path) as f:
                 self._index = json.load(f)
@@ -65,7 +65,11 @@ class DrugGraphTarLoader:
         self._lru_maxsize = 8
         self._graph_cache: dict = {}
 
-        if cache_in_memory:
+        if packed_cache_path and os.path.isfile(packed_cache_path):
+            print(f"Loading drug graphs from packed cache: {packed_cache_path}")
+            self._graph_cache = torch.load(packed_cache_path, weights_only=False)
+            print(f"Drug graph cache ready: {len(self._graph_cache)} entries")
+        elif cache_in_memory:
             self._load_all_into_cache(chembl_to_idx)
 
     def _load_all_into_cache(self, chembl_to_idx: dict):
