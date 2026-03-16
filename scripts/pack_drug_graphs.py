@@ -41,14 +41,18 @@ def main(args):
         by_archive[archive_name].append((cid, member_name))
 
     packed = {}
+    n_skipped = 0
     for archive_name, members in tqdm(by_archive.items(), desc="packing archives"):
         archive_path = os.path.join(args.tar_dir, archive_name)
         with tarfile.open(archive_path) as tf:
             for cid, member_name in members:
-                f = tf.extractfile(member_name)
-                packed[cid] = torch.load(io.BytesIO(f.read()), weights_only=False)
+                try:
+                    f = tf.extractfile(member_name)
+                    packed[cid] = torch.load(io.BytesIO(f.read()), weights_only=False)
+                except Exception:
+                    n_skipped += 1
 
-    print(f"Packed {len(packed)} drug graphs. Saving to {args.out}...")
+    print(f"Packed {len(packed)} drug graphs ({n_skipped} skipped/corrupt). Saving to {args.out}...")
     torch.save(packed, args.out)
     size_gb = os.path.getsize(args.out) / 1e9
     print(f"Done. File size: {size_gb:.2f} GB")
