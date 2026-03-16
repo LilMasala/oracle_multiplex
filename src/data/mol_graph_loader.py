@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
+from tqdm import tqdm
 
 
 class ProteinGraphZipLoader:
@@ -47,7 +48,8 @@ class ProteinGraphZipLoader:
 # NOTE: tarfile.TarFile handles are NOT picklable.
 # Always use num_workers=0 when constructing a DataLoader with MolGraphDataset.
 class DrugGraphTarLoader:
-    def __init__(self, tar_dir: str, chembl_to_idx: dict, index_path: Optional[str] = None):
+    def __init__(self, tar_dir: str, chembl_to_idx: dict, index_path: Optional[str] = None,
+                 cache_in_memory: bool = False):
         if index_path is not None and os.path.isfile(index_path):
             with open(index_path) as f:
                 self._index = json.load(f)
@@ -61,6 +63,27 @@ class DrugGraphTarLoader:
         self._tar_dir = tar_dir
         self._open_archives = collections.OrderedDict()
         self._lru_maxsize = 8
+        self._graph_cache: dict = {}
+
+        if cache_in_memory:
+            self._load_all_into_cache(chembl_to_idx)
+
+    def _load_all_into_cache(self, chembl_to_idx: dict):
+        """Load all drug graphs present in both the index and chembl_to_idx into memory."""
+        wanted = {cid for cid in chembl_to_idx if cid in self._index}
+        by_archive: dict[str, list] = collections.defaultdict(list)
+        for cid in wanted:
+            archive_name, member_name = self._index[cid]
+            by_archive[archive_name].append((cid, member_name))
+        print(f"Caching {len(wanted)} drug graphs from {len(by_archive)} archives...")
+        for archive_name, members in tqdm(by_archive.items(), desc="loading drug graphs"):
+            with tarfile.open(os.path.join(self._tar_dir, archive_name)) as tf:
+                for cid, member_name in members:
+                    f = tf.extractfile(member_name)
+                    self._graph_cache[cid] = torch.load(
+                        io.BytesIO(f.read()), weights_only=False
+                    )
+        print(f"Drug graph cache ready: {len(self._graph_cache)} entries")
 
     def _build_index(self, tar_dir: str) -> dict:
         index = {}
@@ -88,6 +111,8 @@ class DrugGraphTarLoader:
         return handle
 
     def get(self, chembl_id: str) -> Data:
+        if chembl_id in self._graph_cache:
+            return self._graph_cache[chembl_id]
         archive_filename, member_name = self._index[chembl_id]
         tf = self._get_tar(archive_filename)
         f = tf.extractfile(member_name)

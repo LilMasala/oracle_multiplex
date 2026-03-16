@@ -78,7 +78,8 @@ def main(args):
         args.protein_zip, data["protein"].uniprot_id_to_index, cache_in_memory=True
     )
     drug_loader = DrugGraphTarLoader(
-        args.drug_tar_dir, data["drug"].chembl_id_to_index, args.drug_index
+        args.drug_tar_dir, data["drug"].chembl_id_to_index, args.drug_index,
+        cache_in_memory=True,
     )
 
     # 3. Filter to edges where both protein and drug graphs exist
