@@ -139,7 +139,7 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss, n_seen = 0.0, 0
-        for batch in tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False):
+        for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)):
             optimizer.zero_grad()
             prot_batch = batch["prot_batch"].to(device)
             drug_batch = batch["drug_batch"].to(device)
@@ -149,14 +149,31 @@ def main(args):
                 p, d = model(prot_batch, drug_batch)
                 scores = model.scorer(p, d)
                 loss   = F.mse_loss(scores, labels)
+
+            loss_val = float(loss.detach())
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[NaN/Inf] epoch={epoch} step={step} loss={loss_val}")
+                print(f"  scores: min={scores.min():.3f} max={scores.max():.3f} nan={scores.isnan().any()}")
+                print(f"  labels: min={labels.min():.3f} max={labels.max():.3f} nan={labels.isnan().any()}")
+                print(f"  p_emb:  nan={p.isnan().any()} inf={p.isinf().any()}")
+                print(f"  d_emb:  nan={d.isnan().any()} inf={d.isinf().any()}")
+                print(f"  prot_x: nan={prot_batch.x.isnan().any()} inf={prot_batch.x.isinf().any()}")
+                print(f"  drug_x: nan={drug_batch.x.isnan().any()} inf={drug_batch.x.isinf().any()}")
+                print(f"  scaler scale: {scaler.get_scale()}")
+                break
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
+            if step % 100 == 0:
+                print(f"  ep={epoch} step={step} loss={loss_val:.4f} scale={scaler.get_scale():.0f}", flush=True)
+
             bs = labels.size(0)
-            epoch_loss += float(loss.detach()) * bs
+            epoch_loss += loss_val * bs
             n_seen     += bs
 
         epoch_loss /= max(n_seen, 1)
