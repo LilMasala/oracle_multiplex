@@ -85,8 +85,11 @@ def main(args):
     )
 
     # 3. Filter to edges where drug graphs exist
+    # When packed cache is loaded, check against it (not _index) — some drugs in the
+    # full index are corrupt/missing from the cache and would cause EOFError at load time.
+    _available = drug_loader._graph_cache if drug_loader._graph_cache else drug_loader._index
     drug_has_graph = {
-        idx for idx, cid in idx_to_chembl.items() if cid in drug_loader._index
+        idx for idx, cid in idx_to_chembl.items() if cid in _available
     }
     valid = torch.tensor(
         [int(ei[1, i]) in drug_has_graph for i in range(ei.size(1))],

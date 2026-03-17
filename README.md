@@ -35,8 +35,9 @@ TNPLoss                         # Gaussian NLL + ListNet + Lambda-MART ranking l
 | Module | File | Description |
 |---|---|---|
 | `MultiplexPillarSampler` | `src/data/multiplex_loader.py` | Builds per-protein context: neighbors, PPR scores, trust vectors, temporal decay weights |
-| `TNPContextBuilder` | `src/data/context_builder.py` | Converts pillar dicts to TNP context tensors; synthetic prior (Unit 2), drug analog injection (Unit 5), GNN embedding collection (Unit 6) |
-| `ProteinLigandTNP` | `src/models/tnp.py` | Graph-biased TNP with context density gating (Unit 3), PPR centroid interpolation (Unit 4), GNN residual (Unit 6), context affinity anchoring |
+| `TNPContextBuilder` | `src/data/context_builder.py` | Converts pillar dicts to TNP context tensors; synthetic prior (Unit 2), drug analog injection (Unit 5), GNN embedding collection (Unit 6), neighbor-transfer context assembly |
+| `ProteinLigandTNP` | `src/models/tnp.py` | Graph-biased TNP with context density gating (Unit 3), PPR centroid interpolation (Unit 4), GNN residual (Unit 6), context affinity anchoring; self-attention fallback when context is empty (K=0) |
+| `NeighborTransferModel` | `src/models/neighbor_transfer.py` | Baseline that transfers exact-drug activity from structurally/functionally similar proteins; learns a delta correction weighted by drug cosine similarity × PPR × trust |
 | `GraphBiasedMHA` | `src/models/tnp.py` | Multi-head attention with additive PPR logit biases and multiplicative trust V-gate |
 | `TNPLoss` | `src/training/tnp_loss.py` | NLL + ListNet + Lambda-MART composite ranking loss with homoscedastic uncertainty weighting |
 | `build_multiplex_stream` | `src/protocol/prequential.py` | Constructs sequential protein episodes for streaming evaluation |
@@ -102,6 +103,9 @@ Key arguments:
 | `--max-context` | `256` | Max neighbor binding tuples in context set |
 | `--replay-weight` | `0.5` | Experience replay loss scaling |
 | `--n-episodes` | all | Limit episodes for quick testing |
+| `--model-kind` | `tnp` | Model variant: `tnp`, `binding-only`, `global-mean`, or `neighbor-transfer` |
+| `--neighbor-k` | `8` | Top-k drug-similar neighbor bindings per query (for `neighbor-transfer`) |
+| `--historical-protein-frac` | `0.0` | Protein-disjoint fraction consumed before streaming evaluation to seed history |
 | `--enable-synthetic-prior` | off | Inject synthetic prior token at cold-start (Unit 2) |
 | `--drug-analogs` | off | Enable drug analog context injection (Unit 5) |
 | `--use-gnn` | off | Enable 2-layer GAT protein pre-encoder (Unit 6) |
@@ -192,6 +196,34 @@ Each protein appears exactly once in streaming order. This simulates a real scre
 - Sequential online learning: weights updated after each protein
 - Experience replay: subsample of past proteins replayed to prevent forgetting
 
+### Neighbor Transfer Baseline
+
+`NeighborTransferModel` (`src/models/neighbor_transfer.py`) is a lightweight non-TNP baseline for comparison. For each query `(target_protein, drug)`:
+
+1. **Drug-similarity ranking**: retrieves up to `--neighbor-k` revealed bindings from the local neighborhood, scored by `drug_cosine_sim × PPR × trust`
+2. **Weighted transfer**: a learned `weight_net` produces softmax weights over the top-k neighbors; predicted affinity = weighted sum of neighbor affinities
+3. **Delta correction**: a parallel `delta_net` predicts a residual applied to the weighted transfer
+4. **Cold-start fallback**: when no neighbors exist, falls back to a direct `BindingEncoder(target_protein, drug) + global_mean_affinity` prior
+
+Both `weight_net` and `delta_net` are 3-layer MLPs consuming concatenated `(target_protein, neighbor_protein, delta_protein, target_drug, neighbor_drug, delta_drug, affinity, PPR, trust, drug_sim)` features. Optional GO fingerprint features are appended when available.
+
+Run with:
+```bash
+python run_streaming_exp_tnp.py --model-kind neighbor-transfer --neighbor-k 8
+```
+
+### Historical Seed Split
+
+The `--historical-protein-frac` flag reserves a protein-disjoint fraction of the stream as a **historical seed phase** consumed before evaluation begins. During this phase the model trains normally on each protein, revealing its edges and adding them to the growing binding graph, so that the streamed evaluation starts with pre-warmed history rather than a completely empty graph.
+
+```bash
+python run_streaming_exp_tnp.py --historical-protein-frac 0.2
+```
+
+This splits the shuffled episode list into:
+- **Historical (20%)** — trained on, edges revealed, added to replay buffer; no metrics recorded
+- **Streamed (80%)** — standard prequential evaluation: rank blind, then train
+
 ### Context Assembly
 
 `TNPContextBuilder` populates the context set from the pillar dict produced by `MultiplexPillarSampler`:
@@ -211,7 +243,8 @@ oracle_multiplex/
 │   │   ├── drug_analog_index.py   # DrugAnalogIndex (Unit 5)
 │   │   └── make_graph.py
 │   ├── models/
-│   │   ├── tnp.py                 # ProteinLigandTNP (+ Units 3, 4, 6; affinity anchoring)
+│   │   ├── tnp.py                 # ProteinLigandTNP (+ Units 3, 4, 6; affinity anchoring; K=0 path)
+│   │   ├── neighbor_transfer.py   # NeighborTransferModel — drug-similarity transfer baseline
 │   │   ├── protein_gnn.py         # ProteinGNN — 2-layer GAT pre-encoder (Unit 6)
 │   │   ├── multiplex_moe.py       # (Legacy v1) MultiplexMoE orchestrator
 │   │   ├── routing.py             # BayesianMultiplexRouter + ExpertScorer
