@@ -32,7 +32,6 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -153,7 +152,6 @@ def train(state: dict, args):
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
-    scaler = GradScaler()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -164,10 +162,9 @@ def train(state: dict, args):
             drug_batch = batch["drug_batch"].to(device)
             labels     = batch["labels"].to(device)
 
-            with autocast("cuda"):
-                p, d = model(prot_batch, drug_batch)
-                scores = model.scorer(p, d)
-                loss   = F.mse_loss(scores, labels)
+            p, d = model(prot_batch, drug_batch)
+            scores = model.scorer(p, d)
+            loss   = F.mse_loss(scores, labels)
 
             loss_val = float(loss.detach())
 
@@ -179,17 +176,14 @@ def train(state: dict, args):
                 print(f"  d_emb:  nan={d.isnan().any()} inf={d.isinf().any()}")
                 print(f"  prot_x: nan={prot_batch.x.isnan().any()} inf={prot_batch.x.isinf().any()}")
                 print(f"  drug_x: nan={drug_batch.x.isnan().any()} inf={drug_batch.x.isinf().any()}")
-                print(f"  scaler scale: {scaler.get_scale()}")
                 return
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             if step % 100 == 0:
-                print(f"  ep={epoch} step={step} loss={loss_val:.4f} scale={scaler.get_scale():.0f}", flush=True)
+                print(f"  ep={epoch} step={step} loss={loss_val:.4f}", flush=True)
 
             bs = labels.size(0)
             epoch_loss += loss_val * bs
