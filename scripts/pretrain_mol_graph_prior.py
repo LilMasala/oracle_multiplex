@@ -53,7 +53,12 @@ from src.data.mol_graph_loader import (
 )
 
 
-def main(args):
+def setup(args):
+    """
+    Load data, loaders, dataset, and model. Returns a state dict that can be
+    passed to train() and save_embeddings() independently — useful in notebooks
+    to avoid reloading the 60GB drug cache between training runs.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -61,8 +66,8 @@ def main(args):
     data = torch.load(args.hetero_data, weights_only=False)
     data = merge_activity_edges(data, reduce="amax")
 
-    ei = data["protein", "binds_activity", "drug"].edge_index   # [2, N]
-    el = data["protein", "binds_activity", "drug"].edge_label   # [N]
+    ei = data["protein", "binds_activity", "drug"].edge_index
+    el = data["protein", "binds_activity", "drug"].edge_label
 
     num_proteins = int(data["protein"].num_nodes)
     num_drugs    = int(data["drug"].num_nodes)
@@ -118,24 +123,38 @@ def main(args):
         shifted_el = shifted_el[hist_mask]
         print(f"Training edges after historical filter: {ei.size(1)}")
 
-    # Build dataset + dataloader
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
-    loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                         collate_fn=mol_graph_collate_fn, num_workers=0)
 
-    # 4. Model
     model = MolGraphPrior(
         hidden=args.hidden, num_layers=args.num_layers,
         bilinear_rank=args.bilinear_rank,
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    return dict(
+        device=device, model=model, dataset=dataset,
+        prot_loader=prot_loader, drug_loader=drug_loader,
+        drug_has_graph=drug_has_graph,
+        num_proteins=num_proteins, num_drugs=num_drugs,
+        label_offset=label_offset,
+        idx_to_uniprot=idx_to_uniprot, idx_to_chembl=idx_to_chembl,
+    )
+
+
+def train(state: dict, args):
+    """Run the training loop on a pre-built state (from setup())."""
+    device  = state["device"]
+    model   = state["model"]
+    dataset = state["dataset"]
+
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                        collate_fn=mol_graph_collate_fn, num_workers=0)
+
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
     scaler = GradScaler()
 
-    # 5. Training loop
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss, n_seen = 0.0, 0
@@ -161,7 +180,7 @@ def main(args):
                 print(f"  prot_x: nan={prot_batch.x.isnan().any()} inf={prot_batch.x.isinf().any()}")
                 print(f"  drug_x: nan={drug_batch.x.isnan().any()} inf={drug_batch.x.isinf().any()}")
                 print(f"  scaler scale: {scaler.get_scale()}")
-                break
+                return
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -180,7 +199,18 @@ def main(args):
         scheduler.step(epoch_loss)
         print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}")
 
-    # 6. Precompute protein embeddings
+
+def save_embeddings(state: dict, args):
+    """Precompute and save protein/drug embedding tables after training."""
+    device        = state["device"]
+    model         = state["model"]
+    prot_loader   = state["prot_loader"]
+    drug_loader   = state["drug_loader"]
+    drug_has_graph = state["drug_has_graph"]
+    num_proteins  = state["num_proteins"]
+    num_drugs     = state["num_drugs"]
+    label_offset  = state["label_offset"]
+
     print("Precomputing protein embeddings...")
     model.eval()
     prot_emb_final = torch.zeros(num_proteins, args.hidden)
@@ -192,7 +222,6 @@ def main(args):
             emb = model.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
         prot_emb_final[chunk] = emb.cpu()
 
-    # 7. Precompute drug embeddings
     print("Precomputing drug embeddings...")
     drug_emb_final = torch.zeros(num_drugs, args.hidden)
     for start in tqdm(range(0, num_drugs, args.embed_batch_size)):
@@ -206,7 +235,6 @@ def main(args):
             emb = model.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
         drug_emb_final[chunk] = emb.cpu()
 
-    # 8. Save
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
     torch.save({
@@ -217,6 +245,12 @@ def main(args):
         "bilinear_rank": args.bilinear_rank,
     }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
     print(f"Saved to {args.output_dir}")
+
+
+def main(args):
+    state = setup(args)
+    train(state, args)
+    save_embeddings(state, args)
 
 
 if __name__ == "__main__":
