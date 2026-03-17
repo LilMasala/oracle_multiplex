@@ -26,6 +26,8 @@ class GINEEncoder(nn.Module):
         self.norms = nn.ModuleList([nn.BatchNorm1d(hidden) for _ in range(num_layers)])
 
     def forward(self, x, edge_index, edge_attr, batch) -> Tensor:
+        x = torch.nan_to_num(x, nan=0.0)
+        edge_attr = torch.nan_to_num(edge_attr, nan=0.0)
         x = F.relu(self.node_proj(x))
         edge_attr = F.relu(self.edge_proj(edge_attr))
         for conv, norm in zip(self.convs, self.norms):
