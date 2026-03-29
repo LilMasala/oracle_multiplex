@@ -61,7 +61,7 @@ torchrun --nproc_per_node=4 scripts/pretrain_mol_graph_prior.py \
     --bilinear-rank           128 \
     --embed-batch-size        512 \
     --historical-protein-frac 0.5 \
-    --scorer                  bilinear
+    --scorer                  node_cross_attn
     # --scorer                cross_attn
     # --scorer                node_cross_attn
 
