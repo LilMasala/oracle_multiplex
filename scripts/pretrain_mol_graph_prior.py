@@ -431,6 +431,6 @@ if __name__ == "__main__":
     parser.add_argument("--stream-min-edges",    type=int, default=15,
                         help="min_edges for build_multiplex_stream (must match streaming exp)")
     parser.add_argument("--scorer",              default="bilinear",
-                        choices=["bilinear", "cross_attn"],
-                        help="Scoring head: bilinear (default) or cross_attn")
+                        choices=["bilinear", "cross_attn", "node_cross_attn"],
+                        help="Scoring head: bilinear (default), cross_attn, or node_cross_attn")
     main(parser.parse_args())
