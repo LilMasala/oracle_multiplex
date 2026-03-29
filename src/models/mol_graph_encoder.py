@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Tuple
-from torch_geometric.nn import GINEConv, GlobalAttention
+from torch_geometric.nn import GINEConv
+from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.data import Batch
 
 
@@ -23,7 +24,7 @@ class GINEEncoder(nn.Module):
             for _ in range(num_layers)
         ])
         self.norms = nn.ModuleList([nn.BatchNorm1d(hidden) for _ in range(num_layers)])
-        self.pool = GlobalAttention(
+        self.pool = AttentionalAggregation(
             gate_nn=nn.Linear(hidden, 1),
             nn=nn.Linear(hidden, hidden),
         )

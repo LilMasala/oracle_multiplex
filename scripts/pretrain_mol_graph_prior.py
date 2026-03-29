@@ -194,7 +194,10 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
         d_stack = torch.stack([drug_emb_map[d] for d in d_idxs])
         with torch.no_grad():
             scores = model_core.scorer(p_emb, d_stack).cpu().numpy()
-        cis.append(concordance_index(labels, scores))
+        try:
+            cis.append(concordance_index(labels, scores))
+        except ZeroDivisionError:
+            pass
         rho, _ = spearmanr(scores, labels)
         if not np.isnan(rho):
             rhos.append(rho)
@@ -220,7 +223,7 @@ def train(state: dict, args):
                         collate_fn=mol_graph_collate_fn, num_workers=0)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=(rank == 0))
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
     for epoch in range(1, args.epochs + 1):
         sampler.set_epoch(epoch)  # ensures different shuffle per epoch across ranks
