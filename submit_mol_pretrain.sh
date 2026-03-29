@@ -60,7 +60,10 @@ torchrun --nproc_per_node=4 scripts/pretrain_mol_graph_prior.py \
     --lr                      3e-4 \
     --bilinear-rank           128 \
     --embed-batch-size        512 \
-    --historical-protein-frac 0.5
+    --historical-protein-frac 0.5 \
+    --scorer                  bilinear
+    # --scorer                cross_attn
+    # --scorer                node_cross_attn
 
 # ── Wrap up ───────────────────────────────────────────────────────────────────
 kill $VRAM_PID 2>/dev/null || true

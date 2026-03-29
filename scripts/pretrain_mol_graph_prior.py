@@ -135,6 +135,7 @@ def setup(args, rank: int, local_rank: int, world_size: int):
     model_core = MolGraphPrior(
         hidden=args.hidden, num_layers=args.num_layers,
         bilinear_rank=args.bilinear_rank,
+        scorer=args.scorer,
     ).to(device)
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
@@ -164,43 +165,73 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
     if not eligible:
         return ""
 
-    prot_indices = list(eligible.keys())
-    prot_emb_map = {}
-    for start in range(0, len(prot_indices), embed_batch_size):
-        chunk = prot_indices[start: start + embed_batch_size]
-        graphs = [prot_loader.get_by_idx(i) for i in chunk]
-        pb = Batch.from_data_list(graphs).to(device)
-        with torch.no_grad():
-            embs = model_core.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
-        for idx, emb in zip(chunk, embs):
-            prot_emb_map[idx] = emb
-
-    drug_indices = list({d for pairs in eligible.values() for d, _ in pairs})
-    drug_emb_map = {}
-    for start in range(0, len(drug_indices), embed_batch_size):
-        chunk = drug_indices[start: start + embed_batch_size]
-        graphs = [drug_loader.get_by_idx(i) for i in chunk]
-        db = Batch.from_data_list(graphs).to(device)
-        with torch.no_grad():
-            embs = model_core.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
-        for idx, emb in zip(chunk, embs):
-            drug_emb_map[idx] = emb
-
     cis, rhos = [], []
-    for p_idx, pairs in eligible.items():
-        d_idxs = [d for d, _ in pairs]
-        labels = [l for _, l in pairs]
-        p_emb = prot_emb_map[p_idx].unsqueeze(0).expand(len(d_idxs), -1)
-        d_stack = torch.stack([drug_emb_map[d] for d in d_idxs])
-        with torch.no_grad():
-            scores = model_core.scorer(p_emb, d_stack).cpu().numpy()
-        try:
-            cis.append(concordance_index(labels, scores))
-        except ZeroDivisionError:
-            pass
-        rho, _ = spearmanr(scores, labels)
-        if not np.isnan(rho):
-            rhos.append(rho)
+
+    if model_core.scorer_type == "node_cross_attn":
+        # Drug embeddings are protein-dependent: score per protein, batching its drugs together.
+        for p_idx, pairs in eligible.items():
+            d_idxs = [d for d, _ in pairs]
+            labels = [l for _, l in pairs]
+            prot_graph = prot_loader.get_by_idx(p_idx)
+            for start in range(0, len(d_idxs), embed_batch_size):
+                chunk_d = d_idxs[start: start + embed_batch_size]
+                chunk_l = labels[start: start + embed_batch_size]
+                drug_graphs = [drug_loader.get_by_idx(d) for d in chunk_d]
+                pb = Batch.from_data_list([prot_graph] * len(chunk_d)).to(device)
+                db = Batch.from_data_list(drug_graphs).to(device)
+                with torch.no_grad():
+                    p_emb, d_emb = model_core(pb, db)
+                    chunk_scores = model_core.scorer(p_emb, d_emb).cpu().numpy()
+                if start == 0:
+                    all_scores, all_labels = chunk_scores, chunk_l
+                else:
+                    all_scores = np.concatenate([all_scores, chunk_scores])
+                    all_labels = all_labels + chunk_l
+            try:
+                cis.append(concordance_index(all_labels, all_scores))
+            except ZeroDivisionError:
+                pass
+            rho, _ = spearmanr(all_scores, all_labels)
+            if not np.isnan(rho):
+                rhos.append(rho)
+    else:
+        # Precompute all protein and drug embeddings independently (bilinear / cross_attn).
+        prot_indices = list(eligible.keys())
+        prot_emb_map = {}
+        for start in range(0, len(prot_indices), embed_batch_size):
+            chunk = prot_indices[start: start + embed_batch_size]
+            graphs = [prot_loader.get_by_idx(i) for i in chunk]
+            pb = Batch.from_data_list(graphs).to(device)
+            with torch.no_grad():
+                embs = model_core.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
+            for idx, emb in zip(chunk, embs):
+                prot_emb_map[idx] = emb
+
+        drug_indices = list({d for pairs in eligible.values() for d, _ in pairs})
+        drug_emb_map = {}
+        for start in range(0, len(drug_indices), embed_batch_size):
+            chunk = drug_indices[start: start + embed_batch_size]
+            graphs = [drug_loader.get_by_idx(i) for i in chunk]
+            db = Batch.from_data_list(graphs).to(device)
+            with torch.no_grad():
+                embs = model_core.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
+            for idx, emb in zip(chunk, embs):
+                drug_emb_map[idx] = emb
+
+        for p_idx, pairs in eligible.items():
+            d_idxs = [d for d, _ in pairs]
+            labels = [l for _, l in pairs]
+            p_emb   = prot_emb_map[p_idx].unsqueeze(0).expand(len(d_idxs), -1)
+            d_stack = torch.stack([drug_emb_map[d] for d in d_idxs])
+            with torch.no_grad():
+                scores = model_core.scorer(p_emb, d_stack).cpu().numpy()
+            try:
+                cis.append(concordance_index(labels, scores))
+            except ZeroDivisionError:
+                pass
+            rho, _ = spearmanr(scores, labels)
+            if not np.isnan(rho):
+                rhos.append(rho)
 
     if not cis:
         return ""
@@ -290,12 +321,28 @@ def save_embeddings(state: dict, args):
 
     device        = state["device"]
     model_core    = state["model_core"]
+    label_offset  = state["label_offset"]
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
+
+    if args.scorer == "node_cross_attn":
+        # No global precomputation: drug embeddings are protein-dependent.
+        # GNNPrior will run the model per-episode at inference time.
+        torch.save({
+            "label_offset":  label_offset,
+            "hidden":        args.hidden,
+            "bilinear_rank": args.bilinear_rank,
+            "scorer":        args.scorer,
+        }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
+        print(f"Saved model weights (no embedding tables for node_cross_attn)")
+        return
+
     prot_loader   = state["prot_loader"]
     drug_loader   = state["drug_loader"]
     drug_has_graph = state["drug_has_graph"]
     num_proteins  = state["num_proteins"]
     num_drugs     = state["num_drugs"]
-    label_offset  = state["label_offset"]
 
     print("Precomputing protein embeddings...")
     model_core.eval()
@@ -321,14 +368,13 @@ def save_embeddings(state: dict, args):
             emb = model_core.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
         drug_emb_final[chunk] = emb.cpu()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
     torch.save({
         "prot_emb":      prot_emb_final,
         "drug_emb":      drug_emb_final,
         "label_offset":  label_offset,
         "hidden":        args.hidden,
         "bilinear_rank": args.bilinear_rank,
+        "scorer":        args.scorer,
     }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
     print(f"Saved to {args.output_dir}")
 
@@ -384,4 +430,7 @@ if __name__ == "__main__":
                         help="Protein stream shuffle seed (must match --seed in streaming exp)")
     parser.add_argument("--stream-min-edges",    type=int, default=15,
                         help="min_edges for build_multiplex_stream (must match streaming exp)")
+    parser.add_argument("--scorer",              default="bilinear",
+                        choices=["bilinear", "cross_attn"],
+                        help="Scoring head: bilinear (default) or cross_attn")
     main(parser.parse_args())
