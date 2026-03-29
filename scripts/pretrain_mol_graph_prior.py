@@ -4,24 +4,16 @@ Standalone pretraining script for the Molecular Graph Encoder Prior.
 Trains MolGraphPrior on protein-drug binding data using molecular graphs,
 then precomputes and saves embedding tables for fast inference.
 
-Usage:
+Usage (single GPU):
     python scripts/pretrain_mol_graph_prior.py \
       --hetero-data   /path/to/final_graph_data_not_normalized.pt \
       --protein-zip   /path/to/protein_graphs.zip \
       --drug-tar-dir  /path/to/drug_graphs/ \
       --drug-index    /path/to/drug_index.json \
-      --output-dir    /path/to/mol_prior/ \
-      --hidden        256 \
-      --num-layers    4 \
-      --epochs        50 \
-      --batch-size    256 \
-      --lr            1e-3 \
-      --bilinear-rank 128 \
-      --embed-batch-size 512
+      --output-dir    /path/to/mol_prior/
 
-Optional fast drug loading (avoids tar archive I/O):
-      --drug-packed-cache /path/to/drug_graphs_packed.pt
-  (generate with: python scripts/pack_drug_graphs.py ...)
+Usage (multi-GPU, 4 GPUs):
+    torchrun --nproc_per_node=4 scripts/pretrain_mol_graph_prior.py ...
 """
 
 from __future__ import annotations
@@ -30,11 +22,19 @@ import argparse
 import os
 import sys
 
+import collections
+
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from lifelines.utils import concordance_index
+from scipy.stats import spearmanr
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
@@ -52,14 +52,15 @@ from src.data.mol_graph_loader import (
 )
 
 
-def setup(args):
+def setup(args, rank: int, local_rank: int, world_size: int):
     """
     Load data, loaders, dataset, and model. Returns a state dict that can be
     passed to train() and save_embeddings() independently — useful in notebooks
     to avoid reloading the 60GB drug cache between training runs.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    device = torch.device(f"cuda:{local_rank}")
+    if rank == 0:
+        print(f"Device: {device}  (world_size={world_size})")
 
     # 1. Load HeteroData
     data = torch.load(args.hetero_data, weights_only=False)
@@ -73,8 +74,9 @@ def setup(args):
 
     label_offset = float(el.mean())
     shifted_el   = el - label_offset
-    print(f"Proteins: {num_proteins}, Drugs: {num_drugs}")
-    print(f"Binding edges: {ei.size(1)}, label_offset: {label_offset:.4f}")
+    if rank == 0:
+        print(f"Proteins: {num_proteins}, Drugs: {num_drugs}")
+        print(f"Binding edges: {ei.size(1)}, label_offset: {label_offset:.4f}")
 
     # 2. Build loaders
     idx_to_uniprot = data["protein"].index_to_uniprot_id
@@ -89,8 +91,6 @@ def setup(args):
     )
 
     # 3. Filter to edges where drug graphs exist
-    # When packed cache is loaded, check against it (not _index) — some drugs in the
-    # full index are corrupt/missing from the cache and would cause EOFError at load time.
     _available = drug_loader._graph_cache if drug_loader._graph_cache else drug_loader._index
     drug_has_graph = {
         idx for idx, cid in idx_to_chembl.items() if cid in _available
@@ -101,10 +101,12 @@ def setup(args):
     )
     n_before = ei.size(1)
     ei, shifted_el = ei[:, valid], shifted_el[valid]
-    print(f"Training edges after drug-graph filter: {ei.size(1)}/{n_before} "
-          f"({100*ei.size(1)/n_before:.1f}%)")
+    if rank == 0:
+        print(f"Training edges after drug-graph filter: {ei.size(1)}/{n_before} "
+              f"({100*ei.size(1)/n_before:.1f}%)")
 
     # 3b. Filter to historical proteins only (prevents leakage into streaming eval set)
+    val_ei, val_el = None, None
     if args.historical_protein_frac > 0.0:
         from src.protocol.prequential import build_multiplex_stream
         _all_eps = build_multiplex_stream(
@@ -113,91 +115,178 @@ def setup(args):
         )
         _hist_count = int(len(_all_eps) * args.historical_protein_frac)
         hist_prot_set = {int(ep.protein_idx) for ep in _all_eps[:_hist_count]}
-        print(f"Historical protein filter: {len(hist_prot_set)} proteins "
-              f"({args.historical_protein_frac:.0%} of {len(_all_eps)}-episode stream)")
+        if rank == 0:
+            print(f"Historical protein filter: {len(hist_prot_set)} proteins "
+                  f"({args.historical_protein_frac:.0%} of {len(_all_eps)}-episode stream)")
         hist_mask = torch.tensor(
             [int(ei[0, i]) in hist_prot_set for i in range(ei.size(1))], dtype=torch.bool
         )
+        val_ei = ei[:, ~hist_mask]
+        val_el = shifted_el[~hist_mask]
         ei = ei[:, hist_mask]
         shifted_el = shifted_el[hist_mask]
-        print(f"Training edges after historical filter: {ei.size(1)}")
+        if rank == 0:
+            print(f"Training edges after historical filter: {ei.size(1)}")
+            print(f"Validation edges (streaming proteins): {val_ei.size(1)}")
 
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
 
-    model = MolGraphPrior(
+    model_core = MolGraphPrior(
         hidden=args.hidden, num_layers=args.num_layers,
         bilinear_rank=args.bilinear_rank,
     ).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if rank == 0:
+        print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
+
+    model = DDP(model_core, device_ids=[local_rank])
 
     return dict(
-        device=device, model=model, dataset=dataset,
+        device=device, rank=rank, world_size=world_size,
+        model=model, model_core=model_core,
+        dataset=dataset,
         prot_loader=prot_loader, drug_loader=drug_loader,
         drug_has_graph=drug_has_graph,
         num_proteins=num_proteins, num_drugs=num_drugs,
         label_offset=label_offset,
         idx_to_uniprot=idx_to_uniprot, idx_to_chembl=idx_to_chembl,
+        val_ei=val_ei, val_el=val_el,
     )
+
+
+def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device, embed_batch_size):
+    """Compute mean per-protein Spearman on streaming (held-out) proteins. Returns a log string."""
+    model_core.eval()
+    prot_to_pairs = collections.defaultdict(list)
+    for i in range(val_ei.size(1)):
+        prot_to_pairs[int(val_ei[0, i])].append((int(val_ei[1, i]), float(val_el[i])))
+    eligible = {p: pairs for p, pairs in prot_to_pairs.items() if len(pairs) >= 5}
+    if not eligible:
+        return ""
+
+    prot_indices = list(eligible.keys())
+    prot_emb_map = {}
+    for start in range(0, len(prot_indices), embed_batch_size):
+        chunk = prot_indices[start: start + embed_batch_size]
+        graphs = [prot_loader.get_by_idx(i) for i in chunk]
+        pb = Batch.from_data_list(graphs).to(device)
+        with torch.no_grad():
+            embs = model_core.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
+        for idx, emb in zip(chunk, embs):
+            prot_emb_map[idx] = emb
+
+    drug_indices = list({d for pairs in eligible.values() for d, _ in pairs})
+    drug_emb_map = {}
+    for start in range(0, len(drug_indices), embed_batch_size):
+        chunk = drug_indices[start: start + embed_batch_size]
+        graphs = [drug_loader.get_by_idx(i) for i in chunk]
+        db = Batch.from_data_list(graphs).to(device)
+        with torch.no_grad():
+            embs = model_core.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
+        for idx, emb in zip(chunk, embs):
+            drug_emb_map[idx] = emb
+
+    cis, rhos = [], []
+    for p_idx, pairs in eligible.items():
+        d_idxs = [d for d, _ in pairs]
+        labels = [l for _, l in pairs]
+        p_emb = prot_emb_map[p_idx].unsqueeze(0).expand(len(d_idxs), -1)
+        d_stack = torch.stack([drug_emb_map[d] for d in d_idxs])
+        with torch.no_grad():
+            scores = model_core.scorer(p_emb, d_stack).cpu().numpy()
+        cis.append(concordance_index(labels, scores))
+        rho, _ = spearmanr(scores, labels)
+        if not np.isnan(rho):
+            rhos.append(rho)
+
+    if not cis:
+        return ""
+    return (f" | Val CI={np.mean(cis):.4f}"
+            f" Spearman={np.mean(rhos):.4f}"
+            f" (n={len(cis)} streaming proteins)")
 
 
 def train(state: dict, args):
     """Run the training loop on a pre-built state (from setup())."""
-    device  = state["device"]
-    model   = state["model"]
-    dataset = state["dataset"]
+    device     = state["device"]
+    rank       = state["rank"]
+    world_size = state["world_size"]
+    model      = state["model"]       # DDP wrapper
+    model_core = state["model_core"]  # unwrapped, for scorer / eval
+    dataset    = state["dataset"]
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                         collate_fn=mol_graph_collate_fn, num_workers=0)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=(rank == 0))
 
     for epoch in range(1, args.epochs + 1):
+        sampler.set_epoch(epoch)  # ensures different shuffle per epoch across ranks
         model.train()
         epoch_loss, n_seen = 0.0, 0
-        for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)):
+        for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False, disable=(rank != 0))):
             optimizer.zero_grad()
             prot_batch = batch["prot_batch"].to(device)
             drug_batch = batch["drug_batch"].to(device)
             labels     = batch["labels"].to(device)
 
             p, d = model(prot_batch, drug_batch)
-            scores = model.scorer(p, d)
+            scores = model_core.scorer(p, d)
             loss   = F.mse_loss(scores, labels)
 
             loss_val = float(loss.detach())
 
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n[NaN/Inf] epoch={epoch} step={step} loss={loss_val}")
-                print(f"  scores: min={scores.min():.3f} max={scores.max():.3f} nan={scores.isnan().any()}")
-                print(f"  labels: min={labels.min():.3f} max={labels.max():.3f} nan={labels.isnan().any()}")
-                print(f"  p_emb:  nan={p.isnan().any()} inf={p.isinf().any()}")
-                print(f"  d_emb:  nan={d.isnan().any()} inf={d.isinf().any()}")
-                print(f"  prot_x: nan={prot_batch.x.isnan().any()} inf={prot_batch.x.isinf().any()}")
-                print(f"  drug_x: nan={drug_batch.x.isnan().any()} inf={drug_batch.x.isinf().any()}")
+                if rank == 0:
+                    print(f"\n[NaN/Inf] epoch={epoch} step={step} loss={loss_val}")
+                    print(f"  scores: min={scores.min():.3f} max={scores.max():.3f} nan={scores.isnan().any()}")
+                    print(f"  labels: min={labels.min():.3f} max={labels.max():.3f} nan={labels.isnan().any()}")
+                    print(f"  p_emb:  nan={p.isnan().any()} inf={p.isinf().any()}")
+                    print(f"  d_emb:  nan={d.isnan().any()} inf={d.isinf().any()}")
                 return
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if step % 100 == 0:
+            if rank == 0 and step % 100 == 0:
                 print(f"  ep={epoch} step={step} loss={loss_val:.4f}", flush=True)
 
             bs = labels.size(0)
             epoch_loss += loss_val * bs
             n_seen     += bs
 
-        epoch_loss /= max(n_seen, 1)
+        # Average epoch loss across all ranks
+        loss_tensor = torch.tensor(epoch_loss / max(n_seen, 1), device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        epoch_loss = loss_tensor.item() / world_size
+
         scheduler.step(epoch_loss)
-        print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if rank == 0:
+            val_spearman_str = ""
+            val_ei = state.get("val_ei")
+            val_el = state.get("val_el")
+            if val_ei is not None and val_ei.size(1) > 0:
+                val_spearman_str = _eval_streaming_spearman(
+                    model_core, state["prot_loader"], state["drug_loader"],
+                    val_ei, val_el, device, args.embed_batch_size,
+                )
+            print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}"
+                  + val_spearman_str)
+
+        model.train()
 
 
 def save_embeddings(state: dict, args):
-    """Precompute and save protein/drug embedding tables after training."""
+    """Precompute and save protein/drug embedding tables after training. Rank 0 only."""
+    if state["rank"] != 0:
+        return
+
     device        = state["device"]
-    model         = state["model"]
+    model_core    = state["model_core"]
     prot_loader   = state["prot_loader"]
     drug_loader   = state["drug_loader"]
     drug_has_graph = state["drug_has_graph"]
@@ -206,14 +295,14 @@ def save_embeddings(state: dict, args):
     label_offset  = state["label_offset"]
 
     print("Precomputing protein embeddings...")
-    model.eval()
+    model_core.eval()
     prot_emb_final = torch.zeros(num_proteins, args.hidden)
     for start in tqdm(range(0, num_proteins, args.embed_batch_size)):
         chunk = range(start, min(start + args.embed_batch_size, num_proteins))
         graphs = [prot_loader.get_by_idx(i) for i in chunk]
         pb = Batch.from_data_list(graphs).to(device)
         with torch.no_grad():
-            emb = model.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
+            emb = model_core.prot_enc(pb.x, pb.edge_index, pb.edge_attr, pb.batch)
         prot_emb_final[chunk] = emb.cpu()
 
     print("Precomputing drug embeddings...")
@@ -226,11 +315,11 @@ def save_embeddings(state: dict, args):
         graphs = [drug_loader.get_by_idx(i) for i in chunk]
         db = Batch.from_data_list(graphs).to(device)
         with torch.no_grad():
-            emb = model.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
+            emb = model_core.drug_enc(db.x, db.edge_index, db.edge_attr, db.batch)
         drug_emb_final[chunk] = emb.cpu()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
+    torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
     torch.save({
         "prot_emb":      prot_emb_final,
         "drug_emb":      drug_emb_final,
@@ -242,9 +331,29 @@ def save_embeddings(state: dict, args):
 
 
 def main(args):
-    state = setup(args)
+    # Initialize process group (noop if not launched with torchrun)
+    if "LOCAL_RANK" in os.environ:
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank       = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    else:
+        # Single-GPU fallback
+        local_rank = 0
+        rank       = 0
+        world_size = 1
+        # Wrap in a no-op process group so the rest of the code is uniform
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group("gloo", rank=0, world_size=1)
+
+    torch.cuda.set_device(local_rank)
+
+    state = setup(args, rank, local_rank, world_size)
     train(state, args)
+    dist.barrier()  # ensure all ranks finish training before rank 0 saves
     save_embeddings(state, args)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
