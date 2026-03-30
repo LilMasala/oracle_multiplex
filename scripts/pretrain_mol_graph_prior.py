@@ -19,6 +19,7 @@ Usage (multi-GPU, 4 GPUs):
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import sys
 
@@ -319,7 +320,7 @@ def train(state: dict, args):
             val_spearman_str = ""
             val_ei = state.get("val_ei")
             val_el = state.get("val_el")
-            if val_ei is not None and val_ei.size(1) > 0:
+            if val_ei is not None and val_ei.size(1) > 0 and epoch % args.eval_every == 0:
                 val_spearman_str = _eval_streaming_spearman(
                     model_core, state["prot_loader"], state["drug_loader"],
                     val_ei, val_el, device, args.embed_batch_size,
@@ -406,8 +407,9 @@ def save_embeddings(state: dict, args):
 
 def main(args):
     # Initialize process group (noop if not launched with torchrun)
+    _timeout = datetime.timedelta(hours=4)
     if "LOCAL_RANK" in os.environ:
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", timeout=_timeout)
         local_rank = int(os.environ["LOCAL_RANK"])
         rank       = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -458,4 +460,7 @@ if __name__ == "__main__":
     parser.add_argument("--scorer",              default="bilinear",
                         choices=["bilinear", "cross_attn", "node_cross_attn"],
                         help="Scoring head: bilinear (default), cross_attn, or node_cross_attn")
+    parser.add_argument("--eval-every",           type=int, default=5,
+                        help="Run streaming val eval every N epochs (default: 5). "
+                             "node_cross_attn eval is slow (~1hr for 2k proteins); set higher if needed.")
     main(parser.parse_args())
