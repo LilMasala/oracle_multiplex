@@ -15,4 +15,4 @@ pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv \
 pip install torch-geometric
 
 # Everything else
-pip install "pyro-ppl>=1.9.0" "numpy>=1.26.0" "pandas>=2.1.0" "scipy>=1.11.0" "tqdm>=4.66.0" lifelines
+pip install "pyro-ppl>=1.9.0" "numpy>=1.26.0" "pandas>=2.1.0" "scipy>=1.11.0" "tqdm>=4.66.0" lifelines scikit-learn
