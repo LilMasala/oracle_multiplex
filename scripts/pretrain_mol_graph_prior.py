@@ -140,7 +140,7 @@ def setup(args, rank: int, local_rank: int, world_size: int):
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
 
-    model = DDP(model_core, device_ids=[local_rank])
+    model = DDP(model_core, device_ids=[local_rank], find_unused_parameters=True)
 
     return dict(
         device=device, rank=rank, world_size=world_size,
