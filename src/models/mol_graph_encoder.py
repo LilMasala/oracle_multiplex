@@ -167,11 +167,12 @@ class MolGraphPrior(nn.Module):
 
         return torch.cat([ctx[i, :int(drug_sizes[i])] for i in range(B)], dim=0)
 
-    def forward(
+    def encode(
         self,
         prot_batch: Batch,
         drug_batch: Batch,
     ) -> Tuple[Tensor, Tensor]:
+        """Return (p_emb, d_emb) without scoring. Used by eval code."""
         if self.scorer_type == "node_cross_attn":
             p_nodes, p_emb = self.prot_enc(
                 prot_batch.x, prot_batch.edge_index, prot_batch.edge_attr, prot_batch.batch,
@@ -181,8 +182,8 @@ class MolGraphPrior(nn.Module):
                 drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr, drug_batch.batch,
                 return_nodes=True,
             )
-            d_ctx  = self._node_cross_attend(d_nodes, drug_batch.batch, p_nodes, prot_batch.batch)
-            d_emb  = self.drug_pool_ctx(d_ctx, drug_batch.batch)
+            d_ctx = self._node_cross_attend(d_nodes, drug_batch.batch, p_nodes, prot_batch.batch)
+            d_emb = self.drug_pool_ctx(d_ctx, drug_batch.batch)
         else:
             p_emb = self.prot_enc(
                 prot_batch.x, prot_batch.edge_index, prot_batch.edge_attr, prot_batch.batch
@@ -191,6 +192,15 @@ class MolGraphPrior(nn.Module):
                 drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr, drug_batch.batch
             )
         return p_emb, d_emb
+
+    def forward(
+        self,
+        prot_batch: Batch,
+        drug_batch: Batch,
+    ) -> Tensor:
+        """Full forward pass returning scores. Used during training so scorer runs inside DDP."""
+        p_emb, d_emb = self.encode(prot_batch, drug_batch)
+        return self.scorer(p_emb, d_emb)
 
     def predict_links(
         self,

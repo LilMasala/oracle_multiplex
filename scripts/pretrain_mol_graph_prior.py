@@ -140,7 +140,7 @@ def setup(args, rank: int, local_rank: int, world_size: int):
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
 
-    model = DDP(model_core, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model_core, device_ids=[local_rank])
 
     return dict(
         device=device, rank=rank, world_size=world_size,
@@ -180,7 +180,7 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
                 pb = Batch.from_data_list([prot_graph] * len(chunk_d)).to(device)
                 db = Batch.from_data_list(drug_graphs).to(device)
                 with torch.no_grad():
-                    p_emb, d_emb = model_core(pb, db)
+                    p_emb, d_emb = model_core.encode(pb, db)
                     chunk_scores = model_core.scorer(p_emb, d_emb).cpu().numpy()
                 if start == 0:
                     all_scores, all_labels = chunk_scores, chunk_l
@@ -266,8 +266,7 @@ def train(state: dict, args):
             drug_batch = batch["drug_batch"].to(device)
             labels     = batch["labels"].to(device)
 
-            p, d = model(prot_batch, drug_batch)
-            scores = model_core.scorer(p, d)
+            scores = model(prot_batch, drug_batch)
             loss   = F.mse_loss(scores, labels)
 
             loss_val = float(loss.detach())
@@ -277,8 +276,6 @@ def train(state: dict, args):
                     print(f"\n[NaN/Inf] epoch={epoch} step={step} loss={loss_val}")
                     print(f"  scores: min={scores.min():.3f} max={scores.max():.3f} nan={scores.isnan().any()}")
                     print(f"  labels: min={labels.min():.3f} max={labels.max():.3f} nan={labels.isnan().any()}")
-                    print(f"  p_emb:  nan={p.isnan().any()} inf={p.isinf().any()}")
-                    print(f"  d_emb:  nan={d.isnan().any()} inf={d.isinf().any()}")
                 return
 
             loss.backward()
