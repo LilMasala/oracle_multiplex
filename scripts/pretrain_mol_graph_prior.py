@@ -30,6 +30,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from lifelines.utils import concordance_index
 from scipy.stats import spearmanr
+from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -73,10 +74,11 @@ def setup(args, rank: int, local_rank: int, world_size: int):
     num_drugs    = int(data["drug"].num_nodes)
 
     label_offset = float(el.mean())
-    shifted_el   = el - label_offset
+    label_std    = float(el.std().clamp(min=1e-6))
+    shifted_el   = (el - label_offset) / label_std
     if rank == 0:
         print(f"Proteins: {num_proteins}, Drugs: {num_drugs}")
-        print(f"Binding edges: {ei.size(1)}, label_offset: {label_offset:.4f}")
+        print(f"Binding edges: {ei.size(1)}, label_offset: {label_offset:.4f}, label_std: {label_std:.4f}")
 
     # 2. Build loaders
     idx_to_uniprot = data["protein"].index_to_uniprot_id
@@ -149,15 +151,23 @@ def setup(args, rank: int, local_rank: int, world_size: int):
         prot_loader=prot_loader, drug_loader=drug_loader,
         drug_has_graph=drug_has_graph,
         num_proteins=num_proteins, num_drugs=num_drugs,
-        label_offset=label_offset,
+        label_offset=label_offset, label_std=label_std,
         idx_to_uniprot=idx_to_uniprot, idx_to_chembl=idx_to_chembl,
         val_ei=val_ei, val_el=val_el,
     )
 
 
-def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device, embed_batch_size):
-    """Compute mean per-protein Spearman on streaming (held-out) proteins. Returns a log string."""
+def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device,
+                             embed_batch_size, label_offset=0.0, label_std=1.0):
+    """
+    Compute per-protein ranking metrics on streaming (held-out) proteins.
+    Reports unweighted and n_pairs-weighted CI/Spearman, plus AUROC/AUPRC at pX>6.
+    Labels in val_el are standardized; raw pX = label * label_std + label_offset.
+    """
     model_core.eval()
+    # Binarization threshold in standardized label space
+    binary_thresh = (6.0 - label_offset) / label_std
+
     prot_to_pairs = collections.defaultdict(list)
     for i in range(val_ei.size(1)):
         prot_to_pairs[int(val_ei[0, i])].append((int(val_ei[1, i]), float(val_el[i])))
@@ -165,14 +175,31 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
     if not eligible:
         return ""
 
-    cis, rhos = [], []
+    cis, ci_w = [], []
+    rhos, rho_w = [], []
+    aurocs, auprs = [], []
+
+    def _accumulate(all_scores, all_labels, n):
+        try:
+            cis.append(concordance_index(all_labels, all_scores))
+            ci_w.append(n)
+        except ZeroDivisionError:
+            pass
+        rho, _ = spearmanr(all_scores, all_labels)
+        if not np.isnan(rho):
+            rhos.append(rho)
+            rho_w.append(n)
+        y_bin = [1 if l > binary_thresh else 0 for l in all_labels]
+        if len(set(y_bin)) == 2:  # need both classes for ROC/PR
+            aurocs.append(roc_auc_score(y_bin, all_scores))
+            auprs.append(average_precision_score(y_bin, all_scores))
 
     if model_core.scorer_type == "node_cross_attn":
-        # Drug embeddings are protein-dependent: score per protein, batching its drugs together.
         for p_idx, pairs in eligible.items():
             d_idxs = [d for d, _ in pairs]
             labels = [l for _, l in pairs]
             prot_graph = prot_loader.get_by_idx(p_idx)
+            all_scores, all_labels = None, []
             for start in range(0, len(d_idxs), embed_batch_size):
                 chunk_d = d_idxs[start: start + embed_batch_size]
                 chunk_l = labels[start: start + embed_batch_size]
@@ -182,18 +209,9 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
                 with torch.no_grad():
                     p_emb, d_emb = model_core.encode(pb, db)
                     chunk_scores = model_core.scorer(p_emb, d_emb).cpu().numpy()
-                if start == 0:
-                    all_scores, all_labels = chunk_scores, chunk_l
-                else:
-                    all_scores = np.concatenate([all_scores, chunk_scores])
-                    all_labels = all_labels + chunk_l
-            try:
-                cis.append(concordance_index(all_labels, all_scores))
-            except ZeroDivisionError:
-                pass
-            rho, _ = spearmanr(all_scores, all_labels)
-            if not np.isnan(rho):
-                rhos.append(rho)
+                all_scores = chunk_scores if all_scores is None else np.concatenate([all_scores, chunk_scores])
+                all_labels += chunk_l
+            _accumulate(all_scores, all_labels, len(all_labels))
     else:
         # Precompute all protein and drug embeddings independently (bilinear / cross_attn).
         prot_indices = list(eligible.keys())
@@ -225,19 +243,20 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
             d_stack = torch.stack([drug_emb_map[d] for d in d_idxs])
             with torch.no_grad():
                 scores = model_core.scorer(p_emb, d_stack).cpu().numpy()
-            try:
-                cis.append(concordance_index(labels, scores))
-            except ZeroDivisionError:
-                pass
-            rho, _ = spearmanr(scores, labels)
-            if not np.isnan(rho):
-                rhos.append(rho)
+            _accumulate(scores, labels, len(labels))
 
     if not cis:
         return ""
-    return (f" | Val CI={np.mean(cis):.4f}"
-            f" Spearman={np.mean(rhos):.4f}"
-            f" (n={len(cis)} streaming proteins)")
+    ci_uw  = np.mean(cis)
+    ci_w_  = np.average(cis, weights=ci_w)
+    rho_uw = np.mean(rhos) if rhos else float("nan")
+    rho_w_ = np.average(rhos, weights=rho_w) if rhos else float("nan")
+    auroc  = np.mean(aurocs) if aurocs else float("nan")
+    aupr   = np.mean(auprs)  if auprs  else float("nan")
+    return (f" | CI={ci_uw:.4f}(uw)/{ci_w_:.4f}(w)"
+            f" Sp={rho_uw:.4f}(uw)/{rho_w_:.4f}(w)"
+            f" AUROC={auroc:.4f} AUPR={aupr:.4f}"
+            f" (n={len(cis)})")
 
 
 def train(state: dict, args):
@@ -304,6 +323,7 @@ def train(state: dict, args):
                 val_spearman_str = _eval_streaming_spearman(
                     model_core, state["prot_loader"], state["drug_loader"],
                     val_ei, val_el, device, args.embed_batch_size,
+                    label_offset=state["label_offset"], label_std=state["label_std"],
                 )
             print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}"
                   + val_spearman_str)
@@ -324,6 +344,7 @@ def save_embeddings(state: dict, args):
     device        = state["device"]
     model_core    = state["model_core"]
     label_offset  = state["label_offset"]
+    label_std     = state["label_std"]
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
@@ -333,6 +354,7 @@ def save_embeddings(state: dict, args):
         # GNNPrior will run the model per-episode at inference time.
         torch.save({
             "label_offset":  label_offset,
+            "label_std":     label_std,
             "hidden":        args.hidden,
             "bilinear_rank": args.bilinear_rank,
             "scorer":        args.scorer,
@@ -374,6 +396,7 @@ def save_embeddings(state: dict, args):
         "prot_emb":      prot_emb_final,
         "drug_emb":      drug_emb_final,
         "label_offset":  label_offset,
+        "label_std":     label_std,
         "hidden":        args.hidden,
         "bilinear_rank": args.bilinear_rank,
         "scorer":        args.scorer,
