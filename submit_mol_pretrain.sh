@@ -56,7 +56,7 @@ torchrun --nproc_per_node=4 scripts/pretrain_mol_graph_prior.py \
     --hidden                  256 \
     --num-layers              4 \
     --epochs                  50 \
-    --batch-size              256 \
+    --batch-size              32 \
     --lr                      3e-4 \
     --bilinear-rank           128 \
     --embed-batch-size        512 \

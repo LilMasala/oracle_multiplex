@@ -308,6 +308,11 @@ def train(state: dict, args):
             print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}"
                   + val_spearman_str)
 
+        # All ranks wait for rank 0 to finish evaluation before starting the next epoch.
+        # Without this, ranks 1-3 enter the next DDP forward while rank 0 is still in
+        # _eval_streaming_spearman, causing NCCL buffer-sync timeout.
+        dist.barrier()
+
         model.train()
 
 
