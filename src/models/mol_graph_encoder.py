@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Tuple
+from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.nn import GINEConv
 from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.data import Batch
@@ -210,6 +211,104 @@ class MolGraphPrior(nn.Module):
     ) -> Tensor:
         src, dst = edge_index
         return self.scorer(z_dict[edge_type[0]][src], z_dict[edge_type[2]][dst])
+
+
+class ESMGuidedMolPrior(nn.Module):
+    """
+    Drug molecular graph encoder guided by ESM-2 protein embeddings.
+
+    Protein side: a single ESM-2 vector (esm_dim=2816) is expanded into
+    n_aspects learned token vectors (each hidden-dim) so the drug can attend
+    to different protein facets.  No protein GINE — ESM-2 is used directly.
+
+    Drug side: standard GINE on the molecular graph (node_in=20, edge_in=5).
+
+    Cross-attention: drug GINE nodes (Q) attend over protein aspect tokens (K, V).
+    Context-aware drug nodes are then pooled and scored against the protein summary.
+    """
+
+    scorer_type = "esm_cross_attn"
+
+    def __init__(
+        self,
+        esm_dim: int = 2816,
+        drug_node_in: int = 20,
+        drug_edge_in: int = 5,
+        hidden: int = 256,
+        num_layers: int = 4,
+        n_aspects: int = 8,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden = hidden
+        self.n_aspects = n_aspects
+
+        # Protein: ESM-2 → n_aspects tokens of size hidden
+        self.prot_expand = nn.Linear(esm_dim, n_aspects * hidden)
+
+        # Drug: GINE encoder on molecular graph
+        self.drug_enc = DrugGraphEncoder(drug_node_in, drug_edge_in, hidden, num_layers, dropout)
+
+        # Cross-attention: drug nodes attend over protein aspect tokens
+        self.cross_attn = nn.MultiheadAttention(
+            hidden, num_heads, batch_first=True, dropout=dropout
+        )
+
+        # Pool context-aware drug nodes
+        self.drug_pool = AttentionalAggregation(
+            gate_nn=nn.Linear(hidden, 1),
+            nn=nn.Linear(hidden, hidden),
+        )
+
+        # Scorer: concatenate protein summary + drug context
+        self.scorer = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def encode(self, esm_emb: Tensor, drug_batch: Batch) -> Tuple[Tensor, Tensor]:
+        """
+        Returns (prot_summary [B, hidden], drug_ctx [B, hidden]).
+        esm_emb: (B, esm_dim) — one ESM-2 vector per protein in the batch.
+        """
+        B = esm_emb.size(0)
+        device = esm_emb.device
+
+        # Protein aspect tokens: (B, n_aspects, hidden)
+        prot_tokens = self.prot_expand(esm_emb).view(B, self.n_aspects, self.hidden)
+        prot_summary = prot_tokens.mean(dim=1)  # (B, hidden)
+
+        # Drug GINE node embeddings
+        drug_nodes, _ = self.drug_enc(
+            drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr,
+            drug_batch.batch, return_nodes=True,
+        )  # (total_drug_nodes, hidden)
+
+        # Pad drug nodes per batch item for batched attention
+        drug_sizes = torch.bincount(drug_batch.batch, minlength=B).tolist()
+        drug_padded = pad_sequence(
+            list(torch.split(drug_nodes, drug_sizes)), batch_first=True
+        )  # (B, max_nd, hidden)
+        max_nd = drug_padded.size(1)
+        # True = padding position to ignore in attention output unpack
+        drug_pad_mask = torch.arange(max_nd, device=device).unsqueeze(0) >= \
+                        torch.tensor(drug_sizes, device=device).unsqueeze(1)
+
+        # Cross-attention: drug nodes (Q) attend over protein aspect tokens (K, V)
+        # Protein has no padding so key_padding_mask=None on protein side
+        ctx, _ = self.cross_attn(drug_padded, prot_tokens, prot_tokens)
+        # (B, max_nd, hidden)
+
+        # Unpack valid nodes (drop padding) and pool
+        ctx_flat = ctx[~drug_pad_mask]  # (total_drug_nodes, hidden), same order as drug_batch.batch
+        drug_ctx = self.drug_pool(ctx_flat, drug_batch.batch)  # (B, hidden)
+
+        return prot_summary, drug_ctx
+
+    def forward(self, esm_emb: Tensor, drug_batch: Batch) -> Tensor:
+        prot_summary, drug_ctx = self.encode(esm_emb, drug_batch)
+        return self.scorer(torch.cat([prot_summary, drug_ctx], dim=-1)).squeeze(-1)
 
 
 if __name__ == "__main__":

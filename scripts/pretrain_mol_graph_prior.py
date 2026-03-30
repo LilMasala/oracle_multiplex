@@ -43,7 +43,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.data.binds_activity import merge_activity_edges
-from src.models.mol_graph_encoder import MolGraphPrior
+from src.models.mol_graph_encoder import MolGraphPrior, ESMGuidedMolPrior
 from src.data.mol_graph_loader import (
     ProteinGraphZipLoader,
     DrugGraphTarLoader,
@@ -132,11 +132,21 @@ def setup(args, rank: int, local_rank: int, world_size: int):
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
 
-    model_core = MolGraphPrior(
-        hidden=args.hidden, num_layers=args.num_layers,
-        bilinear_rank=args.bilinear_rank,
-        scorer=args.scorer,
-    ).to(device)
+    # Store protein ESM-2 features for esm_cross_attn mode (CPU, indexed by protein global idx)
+    protein_x = data["protein"].x.cpu()
+
+    if args.scorer == "esm_cross_attn":
+        model_core = ESMGuidedMolPrior(
+            esm_dim=protein_x.size(1),
+            hidden=args.hidden,
+            num_layers=args.num_layers,
+        ).to(device)
+    else:
+        model_core = MolGraphPrior(
+            hidden=args.hidden, num_layers=args.num_layers,
+            bilinear_rank=args.bilinear_rank,
+            scorer=args.scorer,
+        ).to(device)
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
 
@@ -152,10 +162,12 @@ def setup(args, rank: int, local_rank: int, world_size: int):
         label_offset=label_offset,
         idx_to_uniprot=idx_to_uniprot, idx_to_chembl=idx_to_chembl,
         val_ei=val_ei, val_el=val_el,
+        protein_x=protein_x,
     )
 
 
-def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device, embed_batch_size):
+def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device,
+                             embed_batch_size, protein_x=None):
     """Compute mean per-protein Spearman on streaming (held-out) proteins. Returns a log string."""
     model_core.eval()
     prot_to_pairs = collections.defaultdict(list)
@@ -167,7 +179,32 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
 
     cis, rhos = [], []
 
-    if model_core.scorer_type == "node_cross_attn":
+    if model_core.scorer_type == "esm_cross_attn":
+        # Use ESM-2 lookup instead of protein GINE. Drug embeddings are protein-dependent.
+        for p_idx, pairs in eligible.items():
+            d_idxs = [d for d, _ in pairs]
+            labels = [l for _, l in pairs]
+            esm_1 = protein_x[p_idx].unsqueeze(0).to(device)  # (1, esm_dim)
+            all_scores, all_labels = None, []
+            for start in range(0, len(d_idxs), embed_batch_size):
+                chunk_d = d_idxs[start: start + embed_batch_size]
+                chunk_l = labels[start: start + embed_batch_size]
+                drug_graphs = [drug_loader.get_by_idx(d) for d in chunk_d]
+                esm_chunk = esm_1.expand(len(chunk_d), -1)  # (chunk_size, esm_dim)
+                db = Batch.from_data_list(drug_graphs).to(device)
+                with torch.no_grad():
+                    chunk_scores = model_core(esm_chunk, db).cpu().numpy()
+                all_scores = chunk_scores if all_scores is None else np.concatenate([all_scores, chunk_scores])
+                all_labels += chunk_l
+            try:
+                cis.append(concordance_index(all_labels, all_scores))
+            except ZeroDivisionError:
+                pass
+            rho, _ = spearmanr(all_scores, all_labels)
+            if not np.isnan(rho):
+                rhos.append(rho)
+
+    elif model_core.scorer_type == "node_cross_attn":
         # Drug embeddings are protein-dependent: score per protein, batching its drugs together.
         for p_idx, pairs in eligible.items():
             d_idxs = [d for d, _ in pairs]
@@ -262,11 +299,15 @@ def train(state: dict, args):
         epoch_loss, n_seen = 0.0, 0
         for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False, disable=(rank != 0))):
             optimizer.zero_grad()
-            prot_batch = batch["prot_batch"].to(device)
             drug_batch = batch["drug_batch"].to(device)
             labels     = batch["labels"].to(device)
 
-            scores = model(prot_batch, drug_batch)
+            if model_core.scorer_type == "esm_cross_attn":
+                esm_emb = state["protein_x"][batch["prot_ids"]].to(device)
+                scores = model(esm_emb, drug_batch)
+            else:
+                prot_batch = batch["prot_batch"].to(device)
+                scores = model(prot_batch, drug_batch)
             loss   = F.mse_loss(scores, labels)
 
             loss_val = float(loss.detach())
@@ -304,6 +345,7 @@ def train(state: dict, args):
                 val_spearman_str = _eval_streaming_spearman(
                     model_core, state["prot_loader"], state["drug_loader"],
                     val_ei, val_el, device, args.embed_batch_size,
+                    protein_x=state.get("protein_x"),
                 )
             print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}"
                   + val_spearman_str)
@@ -328,7 +370,7 @@ def save_embeddings(state: dict, args):
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
 
-    if args.scorer == "node_cross_attn":
+    if args.scorer in ("node_cross_attn", "esm_cross_attn"):
         # No global precomputation: drug embeddings are protein-dependent.
         # GNNPrior will run the model per-episode at inference time.
         torch.save({
@@ -337,7 +379,7 @@ def save_embeddings(state: dict, args):
             "bilinear_rank": args.bilinear_rank,
             "scorer":        args.scorer,
         }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
-        print(f"Saved model weights (no embedding tables for node_cross_attn)")
+        print(f"Saved model weights (no embedding tables for {args.scorer})")
         return
 
     prot_loader   = state["prot_loader"]
@@ -433,6 +475,7 @@ if __name__ == "__main__":
     parser.add_argument("--stream-min-edges",    type=int, default=15,
                         help="min_edges for build_multiplex_stream (must match streaming exp)")
     parser.add_argument("--scorer",              default="bilinear",
-                        choices=["bilinear", "cross_attn", "node_cross_attn"],
-                        help="Scoring head: bilinear (default), cross_attn, or node_cross_attn")
+                        choices=["bilinear", "cross_attn", "node_cross_attn", "esm_cross_attn"],
+                        help="Scoring head: bilinear (default), cross_attn, node_cross_attn, "
+                             "or esm_cross_attn (ESM-2 protein + drug GINE + cross-attention)")
     main(parser.parse_args())
