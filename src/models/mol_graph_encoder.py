@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Tuple
+from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.nn import GINEConv
 from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.data import Batch
@@ -210,6 +211,68 @@ class MolGraphPrior(nn.Module):
     ) -> Tensor:
         src, dst = edge_index
         return self.scorer(z_dict[edge_type[0]][src], z_dict[edge_type[2]][dst])
+
+
+class ESMGuidedMolPrior(nn.Module):
+    """Protein ESM-guided drug graph scorer."""
+
+    scorer_type = "esm_cross_attn"
+
+    def __init__(
+        self,
+        esm_dim: int = 2816,
+        drug_node_in: int = 20,
+        drug_edge_in: int = 5,
+        hidden: int = 256,
+        num_layers: int = 4,
+        n_aspects: int = 8,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden = hidden
+        self.n_aspects = n_aspects
+        self.prot_expand = nn.Linear(esm_dim, n_aspects * hidden)
+        self.drug_enc = DrugGraphEncoder(drug_node_in, drug_edge_in, hidden, num_layers, dropout)
+        self.cross_attn = nn.MultiheadAttention(
+            hidden, num_heads, batch_first=True, dropout=dropout
+        )
+        self.drug_pool = AttentionalAggregation(
+            gate_nn=nn.Linear(hidden, 1),
+            nn=nn.Linear(hidden, hidden),
+        )
+        self.scorer = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def encode(self, esm_emb: Tensor, drug_batch: Batch) -> Tuple[Tensor, Tensor]:
+        batch_size = esm_emb.size(0)
+        device = esm_emb.device
+
+        prot_tokens = self.prot_expand(esm_emb).view(batch_size, self.n_aspects, self.hidden)
+        prot_summary = prot_tokens.mean(dim=1)
+
+        drug_nodes, _ = self.drug_enc(
+            drug_batch.x, drug_batch.edge_index, drug_batch.edge_attr,
+            drug_batch.batch, return_nodes=True,
+        )
+        drug_sizes = torch.bincount(drug_batch.batch, minlength=batch_size).tolist()
+        drug_padded = pad_sequence(list(torch.split(drug_nodes, drug_sizes)), batch_first=True)
+        max_nodes = drug_padded.size(1)
+        drug_pad_mask = (
+            torch.arange(max_nodes, device=device).unsqueeze(0)
+            >= torch.tensor(drug_sizes, device=device).unsqueeze(1)
+        )
+
+        drug_ctx, _ = self.cross_attn(drug_padded, prot_tokens, prot_tokens)
+        drug_ctx_flat = drug_ctx[~drug_pad_mask]
+        pooled_drug_ctx = self.drug_pool(drug_ctx_flat, drug_batch.batch)
+        return prot_summary, pooled_drug_ctx
+
+    def forward(self, esm_emb: Tensor, drug_batch: Batch) -> Tensor:
+        prot_summary, drug_ctx = self.encode(esm_emb, drug_batch)
+        return self.scorer(torch.cat([prot_summary, drug_ctx], dim=-1)).squeeze(-1)
 
 
 if __name__ == "__main__":

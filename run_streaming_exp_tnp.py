@@ -11,6 +11,7 @@ This script keeps the cold-start evaluator honest:
 from __future__ import annotations
 
 import argparse
+import collections
 import os
 from typing import Optional
 
@@ -19,16 +20,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch_geometric.data import Batch
 
 from src.data.binds_activity import merge_activity_edges
 from src.data.context_builder import TNPContextBuilder
 from src.data.diverse_replay_buffer import DiverseReplayBuffer
 from src.data.drug_first_context import DrugFirstContextBuilder
+from src.data.mol_graph_loader import ProteinGraphZipLoader, DrugGraphTarLoader
 from src.data.multiplex_loader import MultiplexPillarSampler
 from src.models.gp_affinity import GPAffinityModel
 from src.models.hetero_sage import HeteroGraphSAGE
+from src.models.mol_graph_encoder import MolGraphPrior, ESMGuidedMolPrior
 from src.models.neighbor_transfer import NeighborTransferModel
-from src.models.mol_graph_encoder import MolGraphPrior
 from src.models.protein_drug_ranker import ProteinDrugRanker
 from src.models.tnp import BindingEncoder, BindingOnlyAffinityModel, ProteinLigandTNP
 from src.protocol.prequential import build_multiplex_stream
@@ -175,6 +178,89 @@ class GNNPrior:
         return scores + self.label_offset
 
 
+class MolGraphPriorRuntime:
+    """Frozen molecular prior with either cached embeddings or runtime graph scoring."""
+
+    def __init__(
+        self,
+        model,
+        label_offset: float,
+        device: torch.device,
+        scorer: str,
+        *,
+        protein_embeddings: Optional[torch.Tensor] = None,
+        drug_embeddings: Optional[torch.Tensor] = None,
+        protein_features: Optional[torch.Tensor] = None,
+        prot_loader: Optional[ProteinGraphZipLoader] = None,
+        drug_loader: Optional[DrugGraphTarLoader] = None,
+        embed_batch_size: int = 256,
+    ):
+        self.gnn = model
+        self.label_offset = label_offset
+        self.device = device
+        self.scorer = scorer
+        self.protein_embeddings = None if protein_embeddings is None else protein_embeddings.cpu()
+        self.drug_embeddings = None if drug_embeddings is None else drug_embeddings.cpu()
+        self.protein_features = protein_features
+        self.prot_loader = prot_loader
+        self.drug_loader = drug_loader
+        self.embed_batch_size = embed_batch_size
+        self._cached_z = None
+
+    def _z_dict(self):
+        if self._cached_z is None:
+            self._cached_z = {
+                "protein": self.protein_embeddings.to(self.device),
+                "drug": self.drug_embeddings.to(self.device),
+            }
+        return self._cached_z
+
+    def _predict_static(self, protein_indices: torch.Tensor, drug_indices: torch.Tensor) -> torch.Tensor:
+        src = protein_indices.to(self.device)
+        dst = drug_indices.to(self.device)
+        scores = self.gnn.predict_links(self._z_dict(), torch.stack([src, dst]))
+        return scores + self.label_offset
+
+    def _predict_dynamic(self, protein_indices: torch.Tensor, drug_indices: torch.Tensor) -> torch.Tensor:
+        protein_indices = protein_indices.cpu()
+        drug_indices = drug_indices.cpu()
+        scores = torch.empty(drug_indices.size(0), dtype=torch.float, device=self.device)
+        grouped = collections.defaultdict(list)
+        for i, p_idx in enumerate(protein_indices.tolist()):
+            grouped[p_idx].append(i)
+
+        for p_idx, positions in grouped.items():
+            pos_tensor = torch.tensor(positions, dtype=torch.long)
+            grouped_drug_indices = drug_indices[pos_tensor]
+            for start in range(0, grouped_drug_indices.numel(), self.embed_batch_size):
+                chunk_pos = pos_tensor[start: start + self.embed_batch_size]
+                chunk_drugs = grouped_drug_indices[start: start + self.embed_batch_size]
+                drug_graphs = [self.drug_loader.get_by_idx(int(d)) for d in chunk_drugs.tolist()]
+                drug_batch = Batch.from_data_list(drug_graphs).to(self.device)
+                with torch.no_grad():
+                    if self.scorer == "esm_cross_attn":
+                        esm_emb = self.protein_features[p_idx].unsqueeze(0).to(self.device)
+                        esm_batch = esm_emb.expand(chunk_drugs.numel(), -1)
+                        chunk_scores = self.gnn(esm_batch, drug_batch)
+                    else:
+                        prot_graph = self.prot_loader.get_by_idx(p_idx)
+                        prot_batch = Batch.from_data_list([prot_graph] * chunk_drugs.numel()).to(self.device)
+                        chunk_scores = self.gnn(prot_batch, drug_batch)
+                scores[chunk_pos.to(self.device)] = chunk_scores
+        return scores + self.label_offset
+
+    @torch.no_grad()
+    def predict(self, protein_idx: int, drug_indices: torch.Tensor) -> torch.Tensor:
+        protein_indices = torch.full((drug_indices.size(0),), protein_idx, dtype=torch.long)
+        return self.predict_batch(protein_indices, drug_indices)
+
+    @torch.no_grad()
+    def predict_batch(self, protein_indices: torch.Tensor, drug_indices: torch.Tensor) -> torch.Tensor:
+        if self.scorer in {"bilinear", "cross_attn"}:
+            return self._predict_static(protein_indices, drug_indices)
+        return self._predict_dynamic(protein_indices, drug_indices)
+
+
 def pretrain_gnn(
     gnn_kind: str,           # "sage" or "ranker"
     data,                    # full HeteroData on device
@@ -282,7 +368,7 @@ def compute_prior(
     qry_drug,            # [n_qry, drug_dim]
     global_mean: float,
     *,
-    gnn_prior: "GNNPrior | None" = None,
+    gnn_prior: "GNNPrior | MolGraphPriorRuntime | None" = None,
     protein_idx: int = 0,
     drug_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -301,7 +387,7 @@ def compute_residuals(
     labels,              # [n]
     global_mean: float,
     *,
-    gnn_prior: "GNNPrior | None" = None,
+    gnn_prior: "GNNPrior | MolGraphPriorRuntime | None" = None,
     protein_indices: Optional[torch.Tensor] = None,
     drug_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -467,6 +553,16 @@ def build_arg_parser():
         help="Directory containing mol_prior_model.pt and mol_prior_tables.pt. "
              "Required when --gnn-prior mol is used.",
     )
+    parser.add_argument("--mol-protein-zip", type=str, default=None,
+                        help="Protein graph zip for runtime mol priors like node_cross_attn")
+    parser.add_argument("--mol-drug-tar-dir", type=str, default=None,
+                        help="Drug graph tar directory for runtime mol priors")
+    parser.add_argument("--mol-drug-index", type=str, default=None,
+                        help="Optional cached drug graph tar index for runtime mol priors")
+    parser.add_argument("--mol-drug-packed-cache", type=str, default=None,
+                        help="Optional packed drug graph cache for runtime mol priors")
+    parser.add_argument("--mol-runtime-batch-size", type=int, default=256,
+                        help="Batch size for runtime graph-dependent mol prior scoring")
     return parser
 
 
@@ -789,7 +885,7 @@ def run_episode_gp(
     query_drug_indices: torch.Tensor,
     global_mean_affinity: float = 6.5,
     frozen_be=None,
-    gnn_prior: "GNNPrior | None" = None,
+    gnn_prior: "GNNPrior | MolGraphPriorRuntime | None" = None,
     role_boost: float = 1.0,
 ):
     target = pillar["target_features"]
@@ -831,7 +927,7 @@ def optimize_episode_gp(
     total_episodes: int,
     replay_edges_per_protein: int = 256,
     frozen_be=None,
-    gnn_prior: "GNNPrior | None" = None,
+    gnn_prior: "GNNPrior | MolGraphPriorRuntime | None" = None,
     role_boost: float = 1.0,
 ):
     train_loss = nll_val = replay_loss_val = float("nan")
@@ -1072,10 +1168,23 @@ def main():
             tables = torch.load(
                 os.path.join(args.mol_prior_dir, "mol_prior_tables.pt"), weights_only=False
             )
-            _mol_model = MolGraphPrior(
-                hidden=int(tables["hidden"]),
-                bilinear_rank=int(tables["bilinear_rank"]),
-            ).to(device)
+            scorer = str(tables.get("scorer", "bilinear"))
+            hidden = int(tables["hidden"])
+            num_layers = int(tables.get("num_layers", 4))
+            bilinear_rank = int(tables.get("bilinear_rank", 128))
+            if scorer == "esm_cross_attn":
+                _mol_model = ESMGuidedMolPrior(
+                    esm_dim=int(data["protein"].x.size(1)),
+                    hidden=hidden,
+                    num_layers=num_layers,
+                ).to(device)
+            else:
+                _mol_model = MolGraphPrior(
+                    hidden=hidden,
+                    num_layers=num_layers,
+                    bilinear_rank=bilinear_rank,
+                    scorer=scorer,
+                ).to(device)
             _mol_model.load_state_dict(
                 torch.load(
                     os.path.join(args.mol_prior_dir, "mol_prior_model.pt"), weights_only=False
@@ -1084,12 +1193,39 @@ def main():
             for _p in _mol_model.parameters():
                 _p.requires_grad_(False)
             _mol_model.eval()
-            gnn_prior = GNNPrior(
-                gnn=_mol_model,
-                protein_embeddings=tables["prot_emb"],
-                drug_embeddings=tables["drug_emb"],
+            runtime_kwargs = {}
+            if scorer in {"node_cross_attn", "esm_cross_attn"}:
+                assert args.mol_drug_tar_dir is not None, (
+                    "--mol-drug-tar-dir is required for graph-dependent mol priors"
+                )
+                if scorer == "node_cross_attn":
+                    assert args.mol_protein_zip is not None, (
+                        "--mol-protein-zip is required for node_cross_attn mol priors"
+                    )
+                    runtime_kwargs["prot_loader"] = ProteinGraphZipLoader(
+                        args.mol_protein_zip,
+                        data["protein"].uniprot_id_to_index,
+                        cache_in_memory=True,
+                    )
+                runtime_kwargs["drug_loader"] = DrugGraphTarLoader(
+                    args.mol_drug_tar_dir,
+                    data["drug"].chembl_id_to_index,
+                    args.mol_drug_index,
+                    cache_in_memory=False,
+                    packed_cache_path=args.mol_drug_packed_cache,
+                )
+                if scorer == "esm_cross_attn":
+                    runtime_kwargs["protein_features"] = data["protein"].x.cpu()
+            else:
+                runtime_kwargs["protein_embeddings"] = tables["prot_emb"]
+                runtime_kwargs["drug_embeddings"] = tables["drug_emb"]
+            gnn_prior = MolGraphPriorRuntime(
+                model=_mol_model,
                 label_offset=float(tables["label_offset"]),
                 device=device,
+                scorer=scorer,
+                embed_batch_size=args.mol_runtime_batch_size,
+                **runtime_kwargs,
             )
         elif args.gnn_prior in ("sage", "ranker"):
             gnn_label_offset = args.gnn_label_offset if args.gnn_label_offset is not None else global_mean_affinity

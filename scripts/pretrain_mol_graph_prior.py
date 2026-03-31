@@ -45,13 +45,88 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.data.binds_activity import merge_activity_edges
-from src.models.mol_graph_encoder import MolGraphPrior
+from src.models.mol_graph_encoder import MolGraphPrior, ESMGuidedMolPrior
 from src.data.mol_graph_loader import (
     ProteinGraphZipLoader,
     DrugGraphTarLoader,
     MolGraphDataset,
     mol_graph_collate_fn,
 )
+
+
+def compute_training_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    prot_ids: torch.Tensor,
+    *,
+    loss_type: str,
+    mse_weight: float,
+    rank_weight: float,
+    rank_margin: float,
+) -> dict:
+    mse_loss = F.mse_loss(scores, labels)
+    zero = scores.new_zeros(())
+
+    if loss_type == "mse":
+        return {
+            "total": mse_loss,
+            "mse": mse_loss.detach(),
+            "rank": zero.detach(),
+            "n_pairs": 0,
+        }
+
+    score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    label_diff = labels.unsqueeze(1) - labels.unsqueeze(0)
+    same_protein = prot_ids.unsqueeze(1) == prot_ids.unsqueeze(0)
+    upper = torch.triu(torch.ones_like(same_protein, dtype=torch.bool), diagonal=1)
+    pair_mask = same_protein & upper & (label_diff.abs() >= rank_margin)
+
+    if pair_mask.any():
+        target_sign = label_diff[pair_mask].sign()
+        pred_margin = score_diff[pair_mask] * target_sign
+        pair_weights = label_diff[pair_mask].abs()
+        rank_terms = F.softplus(-pred_margin)
+        rank_loss = (rank_terms * pair_weights).sum() / pair_weights.sum().clamp_min(1e-6)
+        n_pairs = int(pair_mask.sum().item())
+    else:
+        rank_loss = zero
+        n_pairs = 0
+
+    if loss_type == "bpr":
+        total = rank_loss
+    elif loss_type == "hybrid":
+        total = mse_weight * mse_loss + rank_weight * rank_loss
+    else:
+        raise ValueError(f"Unknown loss_type={loss_type}")
+
+    return {
+        "total": total,
+        "mse": mse_loss.detach(),
+        "rank": rank_loss.detach(),
+        "n_pairs": n_pairs,
+    }
+
+
+def summarize_label_split(name: str, edge_index: torch.Tensor, edge_label: torch.Tensor,
+                          *, label_offset: float, label_std: float) -> str:
+    if edge_label is None or edge_label.numel() == 0:
+        return f"{name}: empty"
+
+    raw = edge_label * label_std + label_offset
+    proteins = torch.unique(edge_index[0]).numel()
+    positives = int((raw > 6.0).sum().item())
+    quantiles = torch.quantile(
+        raw.float(),
+        torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], dtype=torch.float),
+    )
+    return (
+        f"{name}: edges={edge_label.numel()} proteins={proteins} "
+        f"raw_mean={raw.mean().item():.3f} raw_std={raw.std().clamp_min(0.0).item():.3f} "
+        f"min={raw.min().item():.3f} q05={quantiles[0].item():.3f} q25={quantiles[1].item():.3f} "
+        f"median={quantiles[2].item():.3f} q75={quantiles[3].item():.3f} q95={quantiles[4].item():.3f} "
+        f"max={raw.max().item():.3f} gt6={positives}/{edge_label.numel()} "
+        f"({100.0 * positives / edge_label.numel():.1f}%)"
+    )
 
 
 def setup(args, rank: int, local_rank: int, world_size: int):
@@ -131,15 +206,36 @@ def setup(args, rank: int, local_rank: int, world_size: int):
         if rank == 0:
             print(f"Training edges after historical filter: {ei.size(1)}")
             print(f"Validation edges (streaming proteins): {val_ei.size(1)}")
+            print(summarize_label_split(
+                "Train label distribution", ei, shifted_el,
+                label_offset=label_offset, label_std=label_std,
+            ))
+            print(summarize_label_split(
+                "Val label distribution", val_ei, val_el,
+                label_offset=label_offset, label_std=label_std,
+            ))
+    elif rank == 0:
+        print(summarize_label_split(
+            "Train label distribution", ei, shifted_el,
+            label_offset=label_offset, label_std=label_std,
+        ))
 
     dataset = MolGraphDataset(ei, shifted_el, prot_loader, drug_loader,
                               idx_to_uniprot, idx_to_chembl)
 
-    model_core = MolGraphPrior(
-        hidden=args.hidden, num_layers=args.num_layers,
-        bilinear_rank=args.bilinear_rank,
-        scorer=args.scorer,
-    ).to(device)
+    protein_x = data["protein"].x.cpu()
+    if args.scorer == "esm_cross_attn":
+        model_core = ESMGuidedMolPrior(
+            esm_dim=protein_x.size(1),
+            hidden=args.hidden,
+            num_layers=args.num_layers,
+        ).to(device)
+    else:
+        model_core = MolGraphPrior(
+            hidden=args.hidden, num_layers=args.num_layers,
+            bilinear_rank=args.bilinear_rank,
+            scorer=args.scorer,
+        ).to(device)
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model_core.parameters()):,}")
 
@@ -154,27 +250,33 @@ def setup(args, rank: int, local_rank: int, world_size: int):
         num_proteins=num_proteins, num_drugs=num_drugs,
         label_offset=label_offset, label_std=label_std,
         idx_to_uniprot=idx_to_uniprot, idx_to_chembl=idx_to_chembl,
+        train_ei=ei, train_el=shifted_el,
         val_ei=val_ei, val_el=val_el,
+        protein_x=protein_x,
     )
 
 
-def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_el, device,
-                             embed_batch_size, label_offset=0.0, label_std=1.0):
+def _eval_ranking_metrics(model_core, prot_loader, drug_loader, edge_index, edge_label, device,
+                          embed_batch_size, label_offset=0.0, label_std=1.0,
+                          protein_x=None, max_proteins=None, prefix="Val"):
     """
-    Compute per-protein ranking metrics on streaming (held-out) proteins.
+    Compute per-protein ranking metrics on a protein-drug edge set.
     Reports unweighted and n_pairs-weighted CI/Spearman, plus AUROC/AUPRC at pX>6.
-    Labels in val_el are standardized; raw pX = label * label_std + label_offset.
+    Labels in edge_label are standardized; raw pX = label * label_std + label_offset.
     """
     model_core.eval()
     # Binarization threshold in standardized label space
     binary_thresh = (6.0 - label_offset) / label_std
 
     prot_to_pairs = collections.defaultdict(list)
-    for i in range(val_ei.size(1)):
-        prot_to_pairs[int(val_ei[0, i])].append((int(val_ei[1, i]), float(val_el[i])))
+    for i in range(edge_index.size(1)):
+        prot_to_pairs[int(edge_index[0, i])].append((int(edge_index[1, i]), float(edge_label[i])))
     eligible = {p: pairs for p, pairs in prot_to_pairs.items() if len(pairs) >= 5}
     if not eligible:
         return ""
+    if max_proteins is not None and len(eligible) > max_proteins:
+        limited_keys = sorted(eligible.keys())[:max_proteins]
+        eligible = {k: eligible[k] for k in limited_keys}
 
     cis, ci_w = [], []
     rhos, rho_w = [], []
@@ -195,7 +297,24 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
             aurocs.append(roc_auc_score(y_bin, all_scores))
             auprs.append(average_precision_score(y_bin, all_scores))
 
-    if model_core.scorer_type == "node_cross_attn":
+    if model_core.scorer_type == "esm_cross_attn":
+        for p_idx, pairs in eligible.items():
+            d_idxs = [d for d, _ in pairs]
+            labels = [l for _, l in pairs]
+            esm_1 = protein_x[p_idx].unsqueeze(0).to(device)
+            all_scores, all_labels = None, []
+            for start in range(0, len(d_idxs), embed_batch_size):
+                chunk_d = d_idxs[start: start + embed_batch_size]
+                chunk_l = labels[start: start + embed_batch_size]
+                drug_graphs = [drug_loader.get_by_idx(d) for d in chunk_d]
+                esm_chunk = esm_1.expand(len(chunk_d), -1)
+                db = Batch.from_data_list(drug_graphs).to(device)
+                with torch.no_grad():
+                    chunk_scores = model_core(esm_chunk, db).cpu().numpy()
+                all_scores = chunk_scores if all_scores is None else np.concatenate([all_scores, chunk_scores])
+                all_labels += chunk_l
+            _accumulate(all_scores, all_labels, len(all_labels))
+    elif model_core.scorer_type == "node_cross_attn":
         for p_idx, pairs in eligible.items():
             d_idxs = [d for d, _ in pairs]
             labels = [l for _, l in pairs]
@@ -254,7 +373,7 @@ def _eval_streaming_spearman(model_core, prot_loader, drug_loader, val_ei, val_e
     rho_w_ = np.average(rhos, weights=rho_w) if rhos else float("nan")
     auroc  = np.mean(aurocs) if aurocs else float("nan")
     aupr   = np.mean(auprs)  if auprs  else float("nan")
-    return (f" | CI={ci_uw:.4f}(uw)/{ci_w_:.4f}(w)"
+    return (f" | {prefix}CI={ci_uw:.4f}(uw)/{ci_w_:.4f}(w)"
             f" Sp={rho_uw:.4f}(uw)/{rho_w_:.4f}(w)"
             f" AUROC={auroc:.4f} AUPR={aupr:.4f}"
             f" (n={len(cis)})")
@@ -280,14 +399,29 @@ def train(state: dict, args):
         sampler.set_epoch(epoch)  # ensures different shuffle per epoch across ranks
         model.train()
         epoch_loss, n_seen = 0.0, 0
+        epoch_mse, epoch_rank = 0.0, 0.0
+        epoch_pairs = 0
         for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False, disable=(rank != 0))):
             optimizer.zero_grad()
-            prot_batch = batch["prot_batch"].to(device)
             drug_batch = batch["drug_batch"].to(device)
             labels     = batch["labels"].to(device)
-
-            scores = model(prot_batch, drug_batch)
-            loss   = F.mse_loss(scores, labels)
+            prot_ids   = batch["prot_ids"].to(device)
+            if model_core.scorer_type == "esm_cross_attn":
+                esm_emb = state["protein_x"][batch["prot_ids"]].to(device)
+                scores = model(esm_emb, drug_batch)
+            else:
+                prot_batch = batch["prot_batch"].to(device)
+                scores = model(prot_batch, drug_batch)
+            loss_dict = compute_training_loss(
+                scores,
+                labels,
+                prot_ids,
+                loss_type=args.loss_type,
+                mse_weight=args.mse_weight,
+                rank_weight=args.rank_weight,
+                rank_margin=args.rank_margin,
+            )
+            loss = loss_dict["total"]
 
             loss_val = float(loss.detach())
 
@@ -303,31 +437,69 @@ def train(state: dict, args):
             optimizer.step()
 
             if rank == 0 and step % 100 == 0:
-                print(f"  ep={epoch} step={step} loss={loss_val:.4f}", flush=True)
+                print(
+                    f"  ep={epoch} step={step} loss={loss_val:.4f} "
+                    f"mse={float(loss_dict['mse']):.4f} rank={float(loss_dict['rank']):.4f} "
+                    f"pairs={loss_dict['n_pairs']}",
+                    flush=True,
+                )
 
             bs = labels.size(0)
             epoch_loss += loss_val * bs
+            epoch_mse += float(loss_dict["mse"]) * bs
+            epoch_rank += float(loss_dict["rank"]) * bs
+            epoch_pairs += int(loss_dict["n_pairs"])
             n_seen     += bs
 
         # Average epoch loss across all ranks
-        loss_tensor = torch.tensor(epoch_loss / max(n_seen, 1), device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        epoch_loss = loss_tensor.item() / world_size
+        metric_tensor = torch.tensor(
+            [
+                epoch_loss / max(n_seen, 1),
+                epoch_mse / max(n_seen, 1),
+                epoch_rank / max(n_seen, 1),
+                float(epoch_pairs),
+            ],
+            device=device,
+        )
+        dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+        epoch_loss = metric_tensor[0].item() / world_size
+        epoch_mse = metric_tensor[1].item() / world_size
+        epoch_rank = metric_tensor[2].item() / world_size
+        epoch_pairs = int(metric_tensor[3].item())
 
         scheduler.step(epoch_loss)
 
         if rank == 0:
-            val_spearman_str = ""
+            train_metric_str = ""
+            val_metric_str = ""
+            train_ei = state.get("train_ei")
+            train_el = state.get("train_el")
             val_ei = state.get("val_ei")
             val_el = state.get("val_el")
+            if epoch % args.eval_every == 0:
+                if train_ei is not None and train_ei.size(1) > 0:
+                    train_metric_str = _eval_ranking_metrics(
+                        model_core, state["prot_loader"], state["drug_loader"],
+                        train_ei, train_el, device, args.embed_batch_size,
+                        label_offset=state["label_offset"], label_std=state["label_std"],
+                        protein_x=state.get("protein_x"),
+                        max_proteins=args.train_eval_max_proteins,
+                        prefix="Train ",
+                    )
             if val_ei is not None and val_ei.size(1) > 0 and epoch % args.eval_every == 0:
-                val_spearman_str = _eval_streaming_spearman(
+                val_metric_str = _eval_ranking_metrics(
                     model_core, state["prot_loader"], state["drug_loader"],
                     val_ei, val_el, device, args.embed_batch_size,
                     label_offset=state["label_offset"], label_std=state["label_std"],
+                    protein_x=state.get("protein_x"),
+                    max_proteins=args.val_eval_max_proteins,
+                    prefix="Val ",
                 )
-            print(f"Epoch {epoch:3d} | MSE={epoch_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.2e}"
-                  + val_spearman_str)
+            print(
+                f"Epoch {epoch:3d} | loss={epoch_loss:.4f} | mse={epoch_mse:.4f} "
+                f"| rank={epoch_rank:.4f} | pairs={epoch_pairs} "
+                f"| lr={optimizer.param_groups[0]['lr']:.2e}"
+                  + train_metric_str + val_metric_str)
 
         # All ranks wait for rank 0 to finish evaluation before starting the next epoch.
         # Without this, ranks 1-3 enter the next DDP forward while rank 0 is still in
@@ -350,17 +522,18 @@ def save_embeddings(state: dict, args):
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model_core.state_dict(), os.path.join(args.output_dir, "mol_prior_model.pt"))
 
-    if args.scorer == "node_cross_attn":
+    if args.scorer in ("node_cross_attn", "esm_cross_attn"):
         # No global precomputation: drug embeddings are protein-dependent.
         # GNNPrior will run the model per-episode at inference time.
         torch.save({
             "label_offset":  label_offset,
             "label_std":     label_std,
             "hidden":        args.hidden,
+            "num_layers":    args.num_layers,
             "bilinear_rank": args.bilinear_rank,
             "scorer":        args.scorer,
         }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
-        print(f"Saved model weights (no embedding tables for node_cross_attn)")
+        print(f"Saved model weights (no embedding tables for {args.scorer})")
         return
 
     prot_loader   = state["prot_loader"]
@@ -399,6 +572,7 @@ def save_embeddings(state: dict, args):
         "label_offset":  label_offset,
         "label_std":     label_std,
         "hidden":        args.hidden,
+        "num_layers":    args.num_layers,
         "bilinear_rank": args.bilinear_rank,
         "scorer":        args.scorer,
     }, os.path.join(args.output_dir, "mol_prior_tables.pt"))
@@ -450,6 +624,19 @@ if __name__ == "__main__":
     parser.add_argument("--lr",                  type=float, default=1e-3)
     parser.add_argument("--bilinear-rank",       type=int, default=128)
     parser.add_argument("--embed-batch-size",    type=int, default=512)
+    parser.add_argument("--loss-type",           default="hybrid",
+                        choices=["mse", "bpr", "hybrid"],
+                        help="Training loss: mse, bpr, or hybrid (mse + within-protein BPR)")
+    parser.add_argument("--mse-weight",          type=float, default=1.0,
+                        help="Weight on the regression term when --loss-type hybrid")
+    parser.add_argument("--rank-weight",         type=float, default=1.0,
+                        help="Weight on the within-protein BPR term when --loss-type hybrid")
+    parser.add_argument("--rank-margin",         type=float, default=0.25,
+                        help="Minimum standardized label gap required to form a ranking pair")
+    parser.add_argument("--train-eval-max-proteins", type=int, default=512,
+                        help="Max number of train proteins to score during periodic train CI eval")
+    parser.add_argument("--val-eval-max-proteins",   type=int, default=None,
+                        help="Optional cap on validation proteins scored during periodic eval")
     parser.add_argument("--historical-protein-frac", type=float, default=0.0,
                         help="Fraction of stream proteins to train on (0.0=all). "
                              "Must match --historical-protein-frac in run_streaming_exp_tnp.py")
@@ -458,8 +645,8 @@ if __name__ == "__main__":
     parser.add_argument("--stream-min-edges",    type=int, default=15,
                         help="min_edges for build_multiplex_stream (must match streaming exp)")
     parser.add_argument("--scorer",              default="bilinear",
-                        choices=["bilinear", "cross_attn", "node_cross_attn"],
-                        help="Scoring head: bilinear (default), cross_attn, or node_cross_attn")
+                        choices=["bilinear", "cross_attn", "node_cross_attn", "esm_cross_attn"],
+                        help="Scoring head: bilinear (default), cross_attn, node_cross_attn, or esm_cross_attn")
     parser.add_argument("--eval-every",           type=int, default=5,
                         help="Run streaming val eval every N epochs (default: 5). "
                              "node_cross_attn eval is slow (~1hr for 2k proteins); set higher if needed.")
