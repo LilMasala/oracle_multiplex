@@ -129,6 +129,105 @@ def summarize_label_split(name: str, edge_index: torch.Tensor, edge_label: torch
     )
 
 
+class ProteinGroupedBatchSampler:
+    """DDP-aware batch sampler that packs multiple edges from the same protein together."""
+
+    def __init__(
+        self,
+        dataset: MolGraphDataset,
+        batch_size: int,
+        proteins_per_batch: int,
+        num_replicas: int,
+        rank: int,
+        seed: int = 42,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.proteins_per_batch = max(1, proteins_per_batch)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.epoch = 0
+        self._cached_len = None
+
+        self.edges_per_protein = max(2, batch_size // self.proteins_per_batch)
+        prot_ids = dataset.edge_index[0].cpu().tolist()
+        grouped = collections.defaultdict(list)
+        for edge_idx, prot_idx in enumerate(prot_ids):
+            grouped[int(prot_idx)].append(edge_idx)
+        self._protein_to_edges = {k: torch.tensor(v, dtype=torch.long) for k, v in grouped.items()}
+        self._protein_ids = sorted(self._protein_to_edges.keys())
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        self._cached_len = None
+
+    def _build_batches(self) -> list[list[int]]:
+        rng = torch.Generator()
+        rng.manual_seed(self.seed + self.epoch)
+
+        protein_ids = list(self._protein_ids)
+        if self.shuffle:
+            perm = torch.randperm(len(protein_ids), generator=rng).tolist()
+            protein_ids = [protein_ids[i] for i in perm]
+
+        chunks = []
+        for prot_idx in protein_ids:
+            edge_ids = self._protein_to_edges[prot_idx]
+            if self.shuffle:
+                edge_ids = edge_ids[torch.randperm(edge_ids.numel(), generator=rng)]
+            for start in range(0, edge_ids.numel(), self.edges_per_protein):
+                chunk = edge_ids[start: start + self.edges_per_protein].tolist()
+                if len(chunk) >= 2:
+                    chunks.append(chunk)
+                elif not self.drop_last and chunk:
+                    chunks.append(chunk)
+
+        if self.shuffle and chunks:
+            perm = torch.randperm(len(chunks), generator=rng).tolist()
+            chunks = [chunks[i] for i in perm]
+
+        batches = []
+        current = []
+        proteins_in_batch = set()
+        for chunk in chunks:
+            chunk_protein = int(self.dataset.edge_index[0, chunk[0]])
+            exceeds_size = len(current) + len(chunk) > self.batch_size
+            exceeds_proteins = len(proteins_in_batch) >= self.proteins_per_batch and chunk_protein not in proteins_in_batch
+            if current and (exceeds_size or exceeds_proteins):
+                if len(current) == self.batch_size or not self.drop_last:
+                    batches.append(current)
+                current = []
+                proteins_in_batch = set()
+            current.extend(chunk)
+            proteins_in_batch.add(chunk_protein)
+
+        if current and (len(current) == self.batch_size or not self.drop_last):
+            batches.append(current)
+
+        if not batches:
+            return []
+        if len(batches) % self.num_replicas != 0:
+            pad = self.num_replicas - (len(batches) % self.num_replicas)
+            batches.extend(batches[:pad])
+        return batches
+
+    def __iter__(self):
+        batches = self._build_batches()
+        self._cached_len = len(batches) // self.num_replicas
+        for batch in batches[self.rank::self.num_replicas]:
+            yield batch
+
+    def __len__(self):
+        if self._cached_len is None:
+            self._cached_len = len(self._build_batches()) // self.num_replicas
+        return self._cached_len
+
+
 def setup(args, rank: int, local_rank: int, world_size: int):
     """
     Load data, loaders, dataset, and model. Returns a state dict that can be
@@ -388,9 +487,35 @@ def train(state: dict, args):
     model_core = state["model_core"]  # unwrapped, for scorer / eval
     dataset    = state["dataset"]
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                        collate_fn=mol_graph_collate_fn, num_workers=0)
+    if args.batching == "protein_grouped":
+        sampler = ProteinGroupedBatchSampler(
+            dataset,
+            batch_size=args.batch_size,
+            proteins_per_batch=args.proteins_per_batch,
+            num_replicas=world_size,
+            rank=rank,
+            seed=args.stream_seed,
+            shuffle=True,
+            drop_last=False,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=mol_graph_collate_fn,
+            num_workers=0,
+        )
+        if rank == 0:
+            print(
+                f"Batching: protein_grouped "
+                f"(batch_size={args.batch_size}, proteins_per_batch={args.proteins_per_batch}, "
+                f"edges_per_protein≈{sampler.edges_per_protein})"
+            )
+    else:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                            collate_fn=mol_graph_collate_fn, num_workers=0)
+        if rank == 0:
+            print(f"Batching: random (batch_size={args.batch_size})")
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
@@ -624,6 +749,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr",                  type=float, default=1e-3)
     parser.add_argument("--bilinear-rank",       type=int, default=128)
     parser.add_argument("--embed-batch-size",    type=int, default=512)
+    parser.add_argument("--batching",            default="random",
+                        choices=["random", "protein_grouped"],
+                        help="Edge batching strategy for training")
+    parser.add_argument("--proteins-per-batch",  type=int, default=4,
+                        help="Approximate number of proteins per training batch when using protein_grouped batching")
     parser.add_argument("--loss-type",           default="hybrid",
                         choices=["mse", "bpr", "hybrid"],
                         help="Training loss: mse, bpr, or hybrid (mse + within-protein BPR)")
