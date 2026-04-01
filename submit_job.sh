@@ -27,6 +27,7 @@ PRIORS=$ORACLE_DIR/multiplex_priors.pt
 PROTEIN_ZIP=$ORACLE_DIR/protein_graphs.zip
 DRUG_TAR_DIR=$ORACLE_DIR/drug_graphs
 DRUG_INDEX=$ORACLE_DIR/drug_index.json
+DRUG_PACKED_CACHE=/sanscratch/aparikh02/oracle_cache/drug_graphs_packed_reassembled.pt
 MOL_PRIOR_DIR=$ORACLE_DIR/mol_prior
 RUN_NAME=oracle_gp_mol_${SLURM_JOB_ID}
 
@@ -44,28 +45,31 @@ echo "GPU:     $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)
 echo "Run:     $RUN_NAME"
 echo "=============================="
 
-# ── Stage 1: Pretrain MolGraphPrior ───────────────────────────────────────────
-echo ""
-echo ">>> Stage 1: Pretrain MolGraphPrior"
-python scripts/pretrain_mol_graph_prior.py \
-    --hetero-data      $HETERO_DATA \
-    --protein-zip      $PROTEIN_ZIP \
-    --drug-tar-dir     $DRUG_TAR_DIR \
-    --drug-index       $DRUG_INDEX \
-    --output-dir       $MOL_PRIOR_DIR \
-    --hidden           256 \
-    --num-layers       4 \
-    --epochs           50 \
-    --batch-size       256 \
-    --lr               1e-3 \
-    --bilinear-rank    128 \
-    --embed-batch-size 512
-
-echo ">>> Stage 1 complete — mol_prior_tables.pt saved to $MOL_PRIOR_DIR"
+# ── Stage 1: Pretrain MolGraphPrior (skip if already trained) ─────────────────
+# echo ""
+# echo ">>> Stage 1: Pretrain MolGraphPrior"
+# torchrun --nproc_per_node=4 scripts/pretrain_mol_graph_prior.py \
+#     --hetero-data      $HETERO_DATA \
+#     --protein-zip      $PROTEIN_ZIP \
+#     --drug-tar-dir     $DRUG_TAR_DIR \
+#     --drug-index       $DRUG_INDEX \
+#     --drug-packed-cache $DRUG_PACKED_CACHE \
+#     --output-dir       $MOL_PRIOR_DIR \
+#     --hidden           256 \
+#     --num-layers       4 \
+#     --epochs           50 \
+#     --batch-size       32 \
+#     --lr               5e-4 \
+#     --bilinear-rank    128 \
+#     --embed-batch-size 512 \
+#     --historical-protein-frac 0.5 \
+#     --scorer           esm_cross_attn \
+#     --eval-every       5
+# echo ">>> Stage 1 complete — mol_prior_tables.pt saved to $MOL_PRIOR_DIR"
 
 # ── Stage 2: Prequential streaming experiment ─────────────────────────────────
 echo ""
-echo ">>> Stage 2: Prequential GP streaming"
+echo ">>> Stage 2: Prequential GP streaming (esm_cross_attn prior)"
 python run_streaming_exp_tnp.py \
     --data                    $HETERO_DATA \
     --priors                  $PRIORS \
@@ -73,6 +77,8 @@ python run_streaming_exp_tnp.py \
     --model-kind              gp \
     --gnn-prior               mol \
     --mol-prior-dir           $MOL_PRIOR_DIR \
+    --mol-drug-tar-dir        $DRUG_TAR_DIR \
+    --mol-drug-packed-cache   $DRUG_PACKED_CACHE \
     --historical-protein-frac 0.5 \
     --history-mode            full \
     --max-context             32 \
