@@ -235,18 +235,30 @@ class MolGraphPriorRuntime:
             for start in range(0, grouped_drug_indices.numel(), self.embed_batch_size):
                 chunk_pos = pos_tensor[start: start + self.embed_batch_size]
                 chunk_drugs = grouped_drug_indices[start: start + self.embed_batch_size]
-                drug_graphs = [self.drug_loader.get_by_idx(int(d)) for d in chunk_drugs.tolist()]
+                drug_graphs, valid_mask = [], []
+                for d in chunk_drugs.tolist():
+                    try:
+                        drug_graphs.append(self.drug_loader.get_by_idx(int(d)))
+                        valid_mask.append(True)
+                    except (KeyError, Exception):
+                        valid_mask.append(False)
+                valid_mask = torch.tensor(valid_mask, dtype=torch.bool)
+                if not valid_mask.any():
+                    scores[chunk_pos.to(self.device)] = 0.0  # will add label_offset at end
+                    continue
                 drug_batch = Batch.from_data_list(drug_graphs).to(self.device)
                 with torch.no_grad():
                     if self.scorer == "esm_cross_attn":
                         esm_emb = self.protein_features[p_idx].unsqueeze(0).to(self.device)
-                        esm_batch = esm_emb.expand(chunk_drugs.numel(), -1)
+                        esm_batch = esm_emb.expand(valid_mask.sum(), -1)
                         chunk_scores = self.gnn(esm_batch, drug_batch)
                     else:
                         prot_graph = self.prot_loader.get_by_idx(p_idx)
-                        prot_batch = Batch.from_data_list([prot_graph] * chunk_drugs.numel()).to(self.device)
+                        prot_batch = Batch.from_data_list([prot_graph] * valid_mask.sum().item()).to(self.device)
                         chunk_scores = self.gnn(prot_batch, drug_batch)
-                scores[chunk_pos.to(self.device)] = chunk_scores
+                full_scores = torch.zeros(len(valid_mask), dtype=chunk_scores.dtype, device=self.device)
+                full_scores[valid_mask.to(self.device)] = chunk_scores
+                scores[chunk_pos.to(self.device)] = full_scores
         return scores + self.label_offset
 
     @torch.no_grad()
