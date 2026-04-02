@@ -11,7 +11,7 @@
 
 set -e
 mkdir -p /zfshomes/aparikh02/ORACLE/logs
-mkdir -p /zfshomes/aparikh02/ORACLE/mol_prior
+mkdir -p /zfshomes/aparikh02/ORACLE/mol_prior_node
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module load cuda/12.4
@@ -28,7 +28,7 @@ PROTEIN_ZIP=$ORACLE_DIR/protein_graphs.zip
 DRUG_TAR_DIR=$ORACLE_DIR/drug_graphs
 DRUG_INDEX=$ORACLE_DIR/drug_index.json
 DRUG_PACKED_CACHE=/sanscratch/aparikh02/oracle_cache/drug_graphs_packed_reassembled.pt
-MOL_PRIOR_DIR=$ORACLE_DIR/mol_prior
+MOL_PRIOR_DIR=$ORACLE_DIR/mol_prior_node
 RUN_NAME=oracle_gp_mol_${SLURM_JOB_ID}
 
 cd $REPO
@@ -77,6 +77,7 @@ python run_streaming_exp_tnp.py \
     --model-kind              gp \
     --gnn-prior               mol \
     --mol-prior-dir           $MOL_PRIOR_DIR \
+    --mol-protein-zip         $PROTEIN_ZIP \
     --mol-drug-tar-dir        $DRUG_TAR_DIR \
     --mol-drug-packed-cache   $DRUG_PACKED_CACHE \
     --historical-protein-frac 0.5 \
