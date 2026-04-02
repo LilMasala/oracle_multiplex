@@ -86,6 +86,7 @@ python run_streaming_exp_tnp.py \
     --lr                      1e-4 \
     --nb-role-boost           1.0 \
     --checkpoint-every        100 \
+    --mol-runtime-batch-size  16 \
     --seed                    42
 
 # ── Wrap up ───────────────────────────────────────────────────────────────────
