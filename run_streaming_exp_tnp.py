@@ -188,6 +188,7 @@ class MolGraphPriorRuntime:
         device: torch.device,
         scorer: str,
         *,
+        label_std: float = 1.0,
         protein_embeddings: Optional[torch.Tensor] = None,
         drug_embeddings: Optional[torch.Tensor] = None,
         protein_features: Optional[torch.Tensor] = None,
@@ -197,6 +198,7 @@ class MolGraphPriorRuntime:
     ):
         self.gnn = model
         self.label_offset = label_offset
+        self.label_std = label_std
         self.device = device
         self.scorer = scorer
         self.protein_embeddings = None if protein_embeddings is None else protein_embeddings.cpu()
@@ -219,7 +221,7 @@ class MolGraphPriorRuntime:
         src = protein_indices.to(self.device)
         dst = drug_indices.to(self.device)
         scores = self.gnn.predict_links(self._z_dict(), torch.stack([src, dst]))
-        return scores + self.label_offset
+        return scores * self.label_std + self.label_offset
 
     def _predict_dynamic(self, protein_indices: torch.Tensor, drug_indices: torch.Tensor) -> torch.Tensor:
         protein_indices = protein_indices.cpu()
@@ -259,7 +261,7 @@ class MolGraphPriorRuntime:
                 full_scores = torch.zeros(len(valid_mask), dtype=chunk_scores.dtype, device=self.device)
                 full_scores[valid_mask.to(self.device)] = chunk_scores
                 scores[chunk_pos.to(self.device)] = full_scores
-        return scores + self.label_offset
+        return scores * self.label_std + self.label_offset
 
     @torch.no_grad()
     def predict(self, protein_idx: int, drug_indices: torch.Tensor) -> torch.Tensor:
@@ -1234,6 +1236,7 @@ def main():
             gnn_prior = MolGraphPriorRuntime(
                 model=_mol_model,
                 label_offset=float(tables["label_offset"]),
+                label_std=float(tables.get("label_std", 1.0)),
                 device=device,
                 scorer=scorer,
                 embed_batch_size=args.mol_runtime_batch_size,
